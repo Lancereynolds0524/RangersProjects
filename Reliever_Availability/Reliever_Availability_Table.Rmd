@@ -1,0 +1,286 @@
+
+---
+title: "Reliever_Availability_Table"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{bash}
+sh /Workspace/Shared/gt-init-script.sh
+```
+
+```{r}
+install.packages(c("vctrs", "gt", "webshot2","slackr"))
+```
+
+
+```{bash}
+sudo apt-get update
+```
+
+```{bash}
+sudo apt-get --yes install libmagick++-dev --fix-missing
+```
+
+```{r}
+devtools::install_github("camdenk/mlbplotR")
+```
+
+
+```{r}
+devtools::install_github("texas-rangers-baseball-club/rangeRs", auth_token = "TOKEN")
+```
+
+
+```{r}
+# Load libraries
+library(slackr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(rangeRs)
+library(mlbplotR)
+library(gt)
+library(stats)
+```
+
+
+```{r}
+pred_avail_query <- "SELECT *
+FROM sandbox.analytics.reliever_availability"
+
+pred_avail <- SparkR::sql(pred_avail_query) %>%
+  SparkR::as.data.frame()
+```
+
+
+```{r}
+# Query competition level from team name
+get_comp_level <- function(team) {
+  team_string <- toString(sprintf("'%s'", team))
+
+  comp_query <- "SELECT DISTINCT HOME_COMPETITION_LEVEL_ABBREV AS COMP_LEVEL
+  FROM snowflake.rpt.VIEW_WHEELHOUSE_PITCHES_MERGE 
+  WHERE HOME_TEAM_NAME = (%s)
+  AND HOME_COMPETITION_LEVEL_ABBREV != 'Unknown'
+  AND HOME_COMPETITION_LEVEL_ABBREV IS NOT NULL
+  AND YEAR = YEAR(CURDATE())"
+
+  comp_query <- sprintf(comp_query, team_string)
+
+  comp_data <- SparkR::sql(comp_query) %>%
+      SparkR::as.data.frame()
+  
+  # Store as a string
+  comp_level <- comp_data$COMP_LEVEL
+
+  return(comp_level)
+}
+```
+
+
+```{r}
+# Get all active players at competition level
+get_all_players <- function(comp_level) {
+    comp_string <- toString(sprintf("'%s'", comp_level))
+
+    players_query <- "select display_last_first_name, txr_player_id, team_name, org, sport_code_name
+    from aws_pg.front_office.player_lookup pl
+    where sport_code_name = (%s)
+    and is_pitcher = TRUE
+    and coalesce(minor_roster_status, major_roster_status) = 'ACT'
+    order by sport_code_name, display_last_first_name"
+
+    players_query <- sprintf(players_query, comp_string)
+
+    players_data <- SparkR::sql(players_query) %>%
+        SparkR::as.data.frame()
+    
+    players_data <- players_data %>%
+        mutate(team_name = ifelse(team_name == 'Oklahoma City Dodgers', 'Oklahoma City Baseball Club', team_name)) %>%
+        mutate(team_name = ifelse(team_name == 'Rome Braves', 'Rome Emperors', team_name))
+
+    return(players_data)
+}
+```
+
+
+```{r}
+# Store all players from desired team in a character vector
+get_team_players_vec <- function(players, team) {
+  team_players_data <- players %>% filter(team_name == team)
+  team_players_24 <- as.character(unique(team_players_data$txr_player_id))
+
+  return(team_players_24)
+}
+```
+
+
+```{r}
+# Filter the data to only include today's pitchers
+get_todays_pitchers <- function(df, team_players) {
+  data_24_today <- df %>% 
+    filter(GAME_DATE == Sys.Date()) %>% 
+    select(TXR_PLAYER_ID, PITCHER_MLB_PLAYER_ID, PLAYER_NAME_LF, GAME_DATE, TEAM_NAME, OPPONENT_NAME, LEVERAGE_INDEX_LAST_7_DAYS, REST_DAYS, PITCH_COUNT_PREV_OUTING, DAYS_THROWN_LAST_7_DAYS, PITCH_COUNT_LAST_7_DAYS, DAYS_THROWN_LAST_14_DAYS, PITCH_COUNT_LAST_14_DAYS, PITCH_PROB_PRED) %>%
+    arrange(desc(PITCH_PROB_PRED)) %>%
+    mutate(PITCH_PROB_PRED = round(PITCH_PROB_PRED * 100, 1))
+
+# Filter further to get only pitchers from the desired team
+  data_24_today_team <- data_24_today %>% 
+    filter(TXR_PLAYER_ID %in% team_players) %>%
+    mutate(PLAYER_NAME_LF = clean_player_names(PLAYER_NAME_LF)) %>%
+    rename(PITCHER = PLAYER_NAME_LF) %>%
+    group_by(TXR_PLAYER_ID, PITCHER) %>%
+    filter(row_number() == 1) %>%
+    ungroup(TXR_PLAYER_ID, PITCHER) %>%
+    mutate(PITCH_PROB_PRED = ifelse(DAYS_THROWN_LAST_7_DAYS == 0, NA, PITCH_PROB_PRED))
+  
+  return(data_24_today_team)
+}
+```
+
+
+```{r}
+# Create reliever availability table using gt
+generate_reliever_availability_plot <- function(df_team, df_all, team, comp_level) {
+  rel_avail <- df_team %>%
+  gt() %>%
+      tab_header(title = md("**Reliever Availability**"),
+                 subtitle = md(paste0(team, " vs. ", df_team %>% filter(TEAM_NAME == team) %>% select(OPPONENT_NAME) %>% filter(row_number() == 1)," (",df_team$GAME_DATE[1],")"))) %>%
+      gt_theme_rangers() %>%
+      cols_label(PITCHER_MLB_PLAYER_ID = md(" "),
+                 PITCHER = md("**Pitcher**"),
+                 LEVERAGE_INDEX_LAST_7_DAYS = md("**LI<br>Last 7 Days**"),
+                 REST_DAYS = md("**# Days Rest**"),
+                 PITCH_COUNT_PREV_OUTING = md("**# Pitches<br>Last Outing**"),
+                 DAYS_THROWN_LAST_7_DAYS = md("**# Outings<br>Last 7 Days**"),
+                 PITCH_COUNT_LAST_7_DAYS = md("**# Pitches<br>Last 7 Days**"),
+                 PITCH_PROB_PRED = md("**% Availability**")) %>%
+      gt_fmt_mlb_dot_headshot(columns = "PITCHER_MLB_PLAYER_ID", height = 40) %>%
+      gt_color_pill(c(PITCH_PROB_PRED),
+                domain = c(min(df_all$PITCH_PROB_PRED) * 100, max(df_all$PITCH_PROB_PRED) * 100),
+                midpoint = mean(df_all$PITCH_PROB_PRED) * 100,
+                palette = c("#E4322E", "white", "#00D02B"),
+                pill_height = 30,
+                accuracy = 0.1) %>%
+      cols_width(PITCHER_MLB_PLAYER_ID ~ px(60),
+                 LEVERAGE_INDEX_LAST_7_DAYS ~ px(130),
+                 REST_DAYS ~ px(130),
+                 PITCH_COUNT_PREV_OUTING ~ px(130),
+                 DAYS_THROWN_LAST_7_DAYS ~ px(130),
+                 PITCH_COUNT_LAST_7_DAYS ~ px(130),
+                 PITCH_PROB_PRED ~ px(130)) %>%
+      cols_align(align = "center",
+                columns = c(LEVERAGE_INDEX_LAST_7_DAYS,
+                            REST_DAYS, 
+                            PITCH_COUNT_PREV_OUTING, 
+                            DAYS_THROWN_LAST_7_DAYS, 
+                            PITCH_COUNT_LAST_7_DAYS, 
+                            PITCH_PROB_PRED)) %>%
+  cols_hide(c(TXR_PLAYER_ID, TEAM_NAME, OPPONENT_NAME, GAME_DATE, DAYS_THROWN_LAST_14_DAYS, PITCH_COUNT_LAST_14_DAYS)) %>%
+  tab_style(style = list(cell_text(style = "italic"), cell_fill(color = "#FFFFED")), locations = cells_body(rows = DAYS_THROWN_LAST_7_DAYS == 0)) %>%
+  tab_footnote(footnote = md("*Leverage Index can be binned into 3 categories: Low = 0-0.85, Medium = 0.85-2, High = 2+, where 1 is average*")) %>%
+  tab_footnote(footnote = md(ifelse(0 %in% df_team$DAYS_THROWN_LAST_7_DAYS, "*Players highlighted in light yellow have exceeded 7 day window but should generally be considered available to pitch", "")))
+
+# Create new directory and store table image here
+filename_team = gsub(' ','_', team)
+
+mainDir <- "/LOCAL_DIRECTORY/"
+subDir <- file.path(mainDir, filename_team)
+  
+  if (!file.exists(subDir)) {
+    dir.create(subDir)
+  }
+  
+  rel_avail %>% gtsave(filename = paste0(subDir,"/", filename_team, "_",comp_level,"_",Sys.Date(),".png"), vwidth = 2000, vheight = 10, expand = 15)
+}
+```
+
+
+```{r}
+# Access file location and send to Slack channel
+save_table <- function(table, team, comp_level) {
+  filename_team = gsub(' ','_', team)
+
+  mainDir <- "/LOCAL_DIRECTORY/"
+  subDir <- file.path(mainDir, filename_team)
+
+# Slackr credentials
+  SLACK_TOKEN = "TOKEN"
+  SLACK_URL = "URL"
+  SLACK_CHANNEL = "reliever_availability_table"
+
+  slackr_setup(token = SLACK_TOKEN, incoming_webhook_url = SLACK_URL)
+
+# Send to appropriate Slack channel
+  slackr_upload(filename = paste0(subDir, "/", filename_team, "_",comp_level,"_",Sys.Date(),".png"), 
+                title = paste0(team, ' (',comp_level,')'),
+                initial_comment =  paste0("Daily Reliever Availability (", Sys.Date(),")"),
+                channels = SLACK_CHANNEL, 
+                token = SLACK_TOKEN,
+                thread_ts = NULL)
+}
+```
+
+
+```{r}
+# Combine all functions into one
+create_table <- function(team, pred_avail) {
+  comp_lvl <- get_comp_level(team)
+  all_players <- get_all_players(comp_lvl)
+  team_players_vec <- get_team_players_vec(all_players, team)
+  todays_pitchers <- get_todays_pitchers(pred_avail, team_players_vec)
+  make_table <- generate_reliever_availability_plot(todays_pitchers, pred_avail, team, comp_lvl)
+  export_table <- save_table(make_table, team, comp_lvl)
+}
+```
+
+
+```{r}
+# Query teams with games today
+teams_query <- "SELECT DISTINCT(HOME_TEAM_NAME) as Team
+FROM silver.statsapi.schedules
+WHERE DATE = current_date()
+AND HOME_TEAM_NAME IN ('Texas Rangers', 'Round Rock Express')
+UNION
+SELECT DISTINCT(AWAY_TEAM_NAME) as Team
+FROM silver.statsapi.schedules
+WHERE DATE = current_date()
+AND AWAY_TEAM_NAME IN ('Texas Rangers', 'Round Rock Express')
+UNION
+SELECT DISTINCT(AWAY_TEAM_NAME) as Team
+FROM silver.statsapi.schedules
+WHERE DATE = current_date()
+AND HOME_TEAM_NAME IN ('Texas Rangers')
+UNION
+SELECT DISTINCT(HOME_TEAM_NAME) as Team
+FROM silver.statsapi.schedules
+WHERE DATE = current_date()
+AND AWAY_TEAM_NAME IN ('Texas Rangers')"
+
+team_names <- SparkR::sql(teams_query) %>% SparkR::as.data.frame()
+
+# Stores team names in a vector
+teams <- team_names$Team
+```
+
+
+```{r}
+# Run "create_table" function for each team
+lapply(teams, function(x) create_table(x, pred_avail))
+```
+
+
+```{r}
+# Function to remove each team directory one at a time
+remove_team <- function(team) {
+    filename_team = gsub(' ','_', team)
+    system(paste0("rm -r /LOCAL_DIRECTORY/", filename_team), 
+    intern = TRUE)
+}
+
+# Delete the team directories
+lapply(teams, remove_team)
+```

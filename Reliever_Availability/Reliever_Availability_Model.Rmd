@@ -1,0 +1,529 @@
+
+---
+title: "Reliever_Availability_Model"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+# Install packages
+install.packages(c("dplyr","tidyr","caret","zoo","lubridate","runner","carrier"))
+remotes::install_version("mlflow", "2.14.1")
+```
+
+
+```{r}
+install.packages("xgboost")
+```
+
+
+```{r}
+# Load libraries
+library(mlflow)
+library(carrier)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(zoo)
+library(lubridate)
+library(runner)
+library(stats)
+library(xgboost)
+```
+
+
+```{r}
+current_year <- format(Sys.Date(), "%Y")
+```
+
+
+```{r}
+# Get workload data for all pitchers
+wl_query <- "SELECT *
+   FROM	(SELECT sub1.PLAYER_NAME_LF
+   			  , sub1.TXR_PLAYER_ID
+   			  , sub1.GAME_YEAR
+   			  , CUR_DATE
+   			  , CUR_GAME
+   			  , CUR_PITCH_COUNT
+					, BF
+   			  , PREV_DATE
+   			  , PREV_GAME
+   			  , PREV_PITCH_COUNT
+		   FROM (SELECT PLAYER_NAME_LF, 
+				TXR_PLAYER_ID, 
+				GAME_YEAR,
+				GAME_DATE AS CUR_DATE, 
+				GAME_NUMBER AS CUR_GAME, 
+				PITCH AS CUR_PITCH_COUNT,
+				PA AS BF
+			FROM snowflake.rpt.VIEW_GAME_LOG_PITCHING 
+			WHERE GAME_YEAR = cast(%s as int) - 1
+			AND COMPETITION_LEVEL_ABBREV = 'MLB'
+			AND GAME_TYPE_CODE = 'R') sub1 
+			INNER JOIN (SELECT PLAYER_NAME_LF, 
+						TXR_PLAYER_ID, 
+						GAME_YEAR,
+						lag(GAME_DATE,1) OVER (PARTITION BY TXR_PLAYER_ID ORDER BY GAME_DATE, GAME_NUMBER) AS PREV_DATE,
+						lag(GAME_NUMBER,1) OVER (PARTITION BY TXR_PLAYER_ID ORDER BY GAME_DATE, GAME_NUMBER) AS PREV_GAME, 
+						lag(PITCH, 1) OVER (PARTITION BY TXR_PLAYER_ID ORDER BY GAME_DATE, GAME_NUMBER) AS PREV_PITCH_COUNT
+						FROM snowflake.rpt.VIEW_GAME_LOG_PITCHING
+						WHERE GAME_YEAR = cast(%s as int) - 1
+						AND COMPETITION_LEVEL_ABBREV = 'MLB'
+						AND GAME_TYPE_CODE = 'R') sub2
+			ON (sub1.PLAYER_NAME_LF = sub2.PLAYER_NAME_LF AND sub1.TXR_PLAYER_ID = sub2.TXR_PLAYER_ID AND sub1.GAME_YEAR = sub2.GAME_YEAR)) sub3
+	WHERE PREV_DATE <= CUR_DATE
+	AND NOT (PREV_DATE = CUR_DATE AND PREV_GAME = CUR_GAME)
+	AND NOT (PREV_DATE = CUR_DATE AND PREV_GAME > CUR_GAME)
+	ORDER BY sub3.PLAYER_NAME_LF, CUR_DATE, CUR_GAME, PREV_DATE, PREV_GAME"
+
+wl_query <- sprintf(wl_query, current_year, current_year)
+
+wl_data <- SparkR::sql(wl_query) %>%
+    SparkR::as.data.frame()
+
+# Workload from current date
+wl_data <- wl_data %>%
+  group_by(PLAYER_NAME_LF, TXR_PLAYER_ID, GAME_YEAR, CUR_DATE, CUR_GAME) %>%
+  mutate(PITCH_COUNT_PREV_OUTING = last(PREV_PITCH_COUNT)) %>%
+  mutate(REST_DAYS = ifelse(row_number() == n(), as.numeric(CUR_DATE - PREV_DATE - 1), 0)) %>%
+  mutate(REST_DAYS = last(REST_DAYS),
+         PITCH_COUNT_PREV_OUTING = mean(PITCH_COUNT_PREV_OUTING))
+
+# Workload over last 7 days
+wl_data_last_7 <- wl_data %>%  
+  filter(CUR_DATE <= PREV_DATE + 7) %>%
+  mutate(START_DATE_7 = min(PREV_DATE),
+         START_GAME_7 = min(PREV_GAME),
+         DAYS_THROWN_LAST_7_DAYS = n(),
+         PITCH_COUNT_LAST_7_DAYS = sum(PREV_PITCH_COUNT)) %>%
+  filter(row_number() == n()) %>%
+  select(PLAYER_NAME_LF, TXR_PLAYER_ID, GAME_YEAR, CUR_DATE, CUR_GAME, START_DATE_7, DAYS_THROWN_LAST_7_DAYS, PITCH_COUNT_LAST_7_DAYS)
+
+# Workload over last 14 days
+wl_data_last_14 <- wl_data %>%  
+  filter(CUR_DATE <= PREV_DATE + 14) %>%
+  mutate(START_DATE_14 = min(PREV_DATE),
+         START_GAME_14 = min(PREV_GAME),
+         DAYS_THROWN_LAST_14_DAYS = n(),
+         PITCH_COUNT_LAST_14_DAYS = sum(PREV_PITCH_COUNT)) %>%
+  filter(row_number() == n()) %>%
+  select(PLAYER_NAME_LF, TXR_PLAYER_ID, GAME_YEAR, CUR_DATE, CUR_GAME, START_DATE_14, DAYS_THROWN_LAST_14_DAYS, PITCH_COUNT_LAST_14_DAYS)
+
+wl_data <- wl_data %>% 
+  group_by(PLAYER_NAME_LF, TXR_PLAYER_ID, CUR_DATE, CUR_GAME) %>%
+  filter(row_number() == n())
+
+wl_data <- merge(wl_data, wl_data_last_7, by = c("PLAYER_NAME_LF","TXR_PLAYER_ID","GAME_YEAR","CUR_DATE","CUR_GAME"), all.x = TRUE)
+wl_data <- merge(wl_data, wl_data_last_14, by = c("PLAYER_NAME_LF","TXR_PLAYER_ID","GAME_YEAR","CUR_DATE","CUR_GAME"), all.x = TRUE)
+
+wl_data <- wl_data %>%
+  mutate(START_DATE_7 = as.Date(ifelse(is.na(START_DATE_7), CUR_DATE - days(7), START_DATE_7)),
+				 START_DATE_14 = as.Date(ifelse(is.na(START_DATE_14), CUR_DATE - days(14), START_DATE_14)),
+         DAYS_THROWN_LAST_7_DAYS = ifelse(is.na(DAYS_THROWN_LAST_7_DAYS), 0, DAYS_THROWN_LAST_7_DAYS),
+         PITCH_COUNT_LAST_7_DAYS = ifelse(is.na(PITCH_COUNT_LAST_7_DAYS), 0, PITCH_COUNT_LAST_7_DAYS),
+				 DAYS_THROWN_LAST_14_DAYS = ifelse(is.na(DAYS_THROWN_LAST_14_DAYS), 0, DAYS_THROWN_LAST_14_DAYS),
+         PITCH_COUNT_LAST_14_DAYS = ifelse(is.na(PITCH_COUNT_LAST_14_DAYS), 0, PITCH_COUNT_LAST_14_DAYS)) %>%
+  select(-PREV_PITCH_COUNT)
+```
+
+
+```{r}
+# Get game log data for all pitchers
+gl_query <- "SELECT gl.PLAYER_NAME_LF, gl.TXR_PLAYER_ID, gl.GAME_YEAR, gl.GAME_DATE, gl.GAME_NUMBER, gl.TEAM_NAME, gl.OPPONENT_NAME, st.*
+		FROM snowflake.rpt.VIEW_GAME_LOG_PITCHING gl
+		INNER JOIN (
+			SELECT whpm.GAME_DATE AS GAME_DATE_2
+				, whpm.GAME_NUMBER AS GAME_NUMBER_2
+                            , whpm.HOME_COMPETITION_LEVEL_ABBREV
+				, whpm.PITCHER_TXR_PLAYER_ID
+				, whpm.IS_STARTING_PITCHER
+                            , sum(CAST(IS_PITCH AS int)) AS PITCH_COUNT_BACKUP
+                            , sum(CAST(IS_PLATE_APPEARANCE AS int)) AS BF_BACKUP
+				, (sum(CAST(IS_MISS AS int)) / CASE WHEN sum(CAST(IS_SWING AS int)) = 0 THEN NULL ELSE sum(CAST(IS_SWING AS int)) END) * 100 AS SWM_RATE
+				, (sum(CAST(IS_STRIKE AS int)) / CASE WHEN sum(CAST(IS_PITCH AS int)) = 0 THEN NULL ELSE sum(CAST(IS_PITCH AS int)) END) * 100 AS STRIKE_RATE
+				, sum(CAST(IS_SO AS int)) AS K
+				, sum(CAST(IS_BB AS int)) AS BB
+				, sum(CAST(IS_PLATE_APPEARANCE AS int)) AS PA
+				, SUM(COALESCE(XWOBA, WOBA)) AS XWOBA_TOTAL
+				, SUM(WOBA_DENOMINATOR) AS XWOBA_COUNT
+				, avg(CASE WHEN whpm.PITCH_TYPE_CATEGORY = 'Fastball' THEN whpm.RELEASE_SPEED ELSE NULL END) AS FB_VELOCITY
+				, avg(CASE WHEN whpm.PITCH_TYPE_CATEGORY = 'Fastball' THEN whpm.STUFF_GRADE ELSE NULL END) AS FB_STUFF_AVG
+			FROM platinum.rpt.whpm_sf whpm
+			WHERE whpm.HOME_COMPETITION_LEVEL_ABBREV = 'MLB'
+			AND whpm.GAME_TYPE_CODE = 'R'
+			AND whpm.IS_PITCH = TRUE
+      AND whpm.RELEASE_SPEED IS NOT NULL 
+      AND (whpm.HAS_TRACKMAN
+    		OR whpm.HAS_HAWKEYE
+    		OR whpm.HAS_STATCAST
+    		OR whpm.HAS_HAWKEYE_MINORS)
+			GROUP BY whpm.GAME_DATE, whpm.PITCHER_TXR_PLAYER_ID, whpm.GAME_NUMBER, whpm.HOME_COMPETITION_LEVEL_ABBREV, whpm.IS_STARTING_PITCHER) st 
+		ON ((gl.TXR_PLAYER_ID = st.PITCHER_TXR_PLAYER_ID)
+			AND (gl.GAME_DATE = st.GAME_DATE_2)
+			AND (gl.GAME_NUMBER = st.GAME_NUMBER_2))
+		WHERE gl.GAME_YEAR IN (cast(%s as int) - 2, cast(%s as int) - 1)
+              AND gl.TEAM_ABBREV != 'Unknown'
+              AND gl.OPPONENT_ABBREV != 'Unknown'
+              AND gl.COMPETITION_LEVEL_ABBREV = 'MLB'
+		ORDER BY gl.PLAYER_NAME_LF, gl.GAME_DATE, gl.GAME_NUMBER"
+  
+gl_query <- sprintf(gl_query, current_year, current_year)
+
+gl_data <- SparkR::sql(gl_query) %>%
+    SparkR::as.data.frame()
+
+# Get leverage index data as well
+li_query <- "select 
+  PITCHER_TXR_PLAYER_ID,
+  GAME_DATE,
+  GAME_NUMBER,
+  round(avg(LEVERAGE_INDEX), 2) as LEVERAGE_INDEX
+from
+(select
+  whpm.PITCHER_TXR_PLAYER_ID,
+  sv.GAME_DATE,
+  whpm.GAME_NUMBER,
+  sv.LEVERAGE_INDEX
+from
+  silver.mlb_bq_savant.onerow_per_pitch sv
+inner join 
+    platinum.rpt.whpm_sf whpm
+on
+    sv.PLAY_ID = whpm.MLB_PLAY_GUID
+where
+  sv.SEASON in (cast(%s as int) - 2, cast(%s as int) - 1)
+  and sv.PITCH_NUMBER = 1
+  and sv.GAME_TYPE = 'R'
+  and whpm.PITCHER_TXR_PLAYER_ID is not null)
+group by
+  PITCHER_TXR_PLAYER_ID, GAME_DATE, GAME_NUMBER
+order by
+  PITCHER_TXR_PLAYER_ID, GAME_DATE, GAME_NUMBER"
+
+li_query <- sprintf(li_query, current_year, current_year)
+
+li_data <- SparkR::sql(li_query) %>%
+    SparkR::as.data.frame()
+
+gl_data <- merge(gl_data, li_data, by.x = c("TXR_PLAYER_ID","GAME_DATE","GAME_NUMBER"), by.y = c("PITCHER_TXR_PLAYER_ID", "GAME_DATE", "GAME_NUMBER"))
+
+gl_data <- gl_data %>%
+  distinct(TXR_PLAYER_ID, GAME_DATE, GAME_NUMBER, PITCH_COUNT_BACKUP, BF_BACKUP, .keep_all = TRUE) %>%
+  group_by(TXR_PLAYER_ID) %>%
+  arrange(GAME_DATE, GAME_NUMBER) %>%
+  summarise(PLAYER_NAME_LF, TXR_PLAYER_ID, PITCH_COUNT_BACKUP, BF_BACKUP, IS_STARTING_PITCHER, GAME_YEAR,
+            GAME_DATE, GAME_NUMBER, TEAM_NAME, OPPONENT_NAME, LEVERAGE_INDEX, # Functions below find rolling averages over last 365
+            ROLLING_P_APP = round(runner(PITCH_COUNT_BACKUP, k = "365 days", idx = GAME_DATE, f = function(x) mean(x, na.rm = TRUE)),2),
+            ROLLING_FB_VELO = round(runner(FB_VELOCITY, k = "365 days", idx = GAME_DATE, f = function(x) mean(x, na.rm = TRUE)),2),
+            ROLLING_SWM_RATE = round(runner(SWM_RATE, k = "365 days", idx = GAME_DATE, f = function(x) mean(x, na.rm = TRUE)),2),
+            ROLLING_FB_STUFF = round(runner(FB_STUFF_AVG, k = "365 days", idx = GAME_DATE, f = function(x) mean(x, na.rm = TRUE)),2),
+            XWOBA_TOTAL_SUM = runner(XWOBA_TOTAL, k = "365 days", idx = GAME_DATE, f = function(x) sum(x, na.rm = TRUE)),
+            XWOBA_COUNT_SUM = runner(XWOBA_COUNT, k = "365 days", idx = GAME_DATE, f = function(x) sum(x, na.rm = TRUE)),
+            K_TOTAL = runner(K, k = "365 days", idx = GAME_DATE, f = function(x) sum(x, na.rm = TRUE)),
+            BB_TOTAL = runner(BB, k = "365 days", idx = GAME_DATE, f = function(x) sum(x, na.rm = TRUE)),
+            PA_TOTAL = runner(PA, k = "365 days", idx = GAME_DATE, f = function(x) sum(x, na.rm = TRUE))) %>%
+  mutate(ROLLING_P_APP = ifelse(row_number() < 10, NA, ROLLING_P_APP), # Removes the first 10 values to eliminate outliers
+         ROLLING_FB_VELO = ifelse(row_number() < 10, NA, ROLLING_FB_VELO), 
+         ROLLING_SWM_RATE = ifelse(row_number() < 10, NA, ROLLING_SWM_RATE),
+         ROLLING_FB_STUFF = ifelse(row_number() < 10, NA, ROLLING_FB_STUFF),
+         XWOBA_TOTAL_SUM = ifelse(row_number() < 10, NA, XWOBA_TOTAL_SUM),
+         XWOBA_COUNT_SUM = ifelse(row_number() < 10, NA, XWOBA_COUNT_SUM),
+         K_TOTAL = ifelse(row_number() < 10, NA, K_TOTAL),
+         BB_TOTAL = ifelse(row_number() < 10, NA, BB_TOTAL),
+         PA_TOTAL = ifelse(row_number() < 10, NA, PA_TOTAL)) %>%
+  mutate(ROLLING_XWOBA = round((XWOBA_TOTAL_SUM / XWOBA_COUNT_SUM),3),
+         ROLLING_K_RATE = round((K_TOTAL / PA_TOTAL) * 100,1),
+         ROLLING_BB_RATE = round((BB_TOTAL / PA_TOTAL) * 100,1),
+         IS_STARTING_PITCHER = ifelse(IS_STARTING_PITCHER == TRUE, 1, 0),
+         LEVERAGE_INDEX = round(LEVERAGE_INDEX, 2)) %>%
+  select(-c(XWOBA_TOTAL_SUM, XWOBA_COUNT_SUM, K_TOTAL, BB_TOTAL, PA_TOTAL)) %>%
+  filter(GAME_YEAR != as.numeric(format(Sys.Date(), "%Y")) - 2)
+```
+
+
+```{r}
+# Query run differential data for all 2023 games
+run_diff_query <- "SELECT GAME_DATE
+, GAME_YEAR
+, GAME_NUMBER
+, HOME_TEAM_NAME as P_TEAM_NAME
+, HOME_SCORE as P_TEAM_SCORE
+, AWAY_TEAM_NAME as O_TEAM_NAME
+, AWAY_SCORE as O_TEAM_SCORE
+, 'Home' as HOME_AWAY
+FROM snowflake.rpt.VIEW_HUB_MLB_GAME 
+WHERE GAME_YEAR = cast(%s as int) - 1
+AND HOME_TEAM_SPORT_NAME = 'Major League Baseball'
+AND GAME_TYPE = 'R'
+UNION
+SELECT GAME_DATE
+, GAME_YEAR
+, GAME_NUMBER
+, AWAY_TEAM_NAME as P_TEAM_NAME
+, AWAY_SCORE as P_TEAM_SCORE
+, HOME_TEAM_NAME as O_TEAM_NAME
+, HOME_SCORE as O_TEAM_SCORE
+, 'Away' as HOME_AWAY
+FROM snowflake.rpt.VIEW_HUB_MLB_GAME 
+WHERE GAME_YEAR = cast(%s as int) - 1
+AND HOME_TEAM_SPORT_NAME = 'Major League Baseball'
+AND GAME_TYPE = 'R'
+ORDER BY P_TEAM_NAME, GAME_DATE, GAME_NUMBER"
+
+run_diff_query <- sprintf(run_diff_query, current_year, current_year)
+
+run_diff_data <- SparkR::sql(run_diff_query) %>%
+    SparkR::as.data.frame() %>%
+    mutate(P_TEAM_SCORE = as.numeric(P_TEAM_SCORE),
+           O_TEAM_SCORE = as.numeric(O_TEAM_SCORE))
+
+run_diff_data <- run_diff_data %>%
+  group_by(P_TEAM_NAME, GAME_YEAR) %>%
+  mutate(RUNS_SCORED = cumsum(ifelse(is.na(P_TEAM_SCORE), 0, P_TEAM_SCORE)),
+         RUNS_ALLOWED = cumsum(ifelse(is.na(O_TEAM_SCORE), 0, O_TEAM_SCORE))) %>%
+  mutate(RUN_DIFF = RUNS_SCORED - RUNS_ALLOWED) %>%
+  mutate(RUN_DIFF = lag(RUN_DIFF)) %>%
+  mutate(RUN_DIFF = ifelse(is.na(RUN_DIFF), 0, RUN_DIFF)) %>%
+  ungroup(P_TEAM_NAME, GAME_YEAR) %>%
+  select(GAME_DATE, GAME_NUMBER, HOME_AWAY, P_TEAM_NAME, O_TEAM_NAME, RUN_DIFF)
+# Query run differential data for opponents as well
+run_diff_opp <- run_diff_data %>%
+  select(GAME_DATE, GAME_NUMBER, O_TEAM_NAME = P_TEAM_NAME, RUN_DIFF_OPP = RUN_DIFF)
+```
+
+
+```{r}
+# Filter to only include pitchers who made at least 70% of appearances out of the pen
+gl_data <- gl_data %>% group_by(TXR_PLAYER_ID) %>% filter(sum(IS_STARTING_PITCHER) / n() <= 0.3)
+
+# Merge workload and game log df together
+gl_wl <- merge(gl_data, wl_data, by.x = c("TXR_PLAYER_ID", "PLAYER_NAME_LF", "GAME_YEAR", "GAME_DATE", "GAME_NUMBER"),
+               by.y = c("TXR_PLAYER_ID", "PLAYER_NAME_LF", "GAME_YEAR", "CUR_DATE", "CUR_GAME"), all.x = TRUE) %>%
+  arrange(PLAYER_NAME_LF, TXR_PLAYER_ID, GAME_DATE, GAME_NUMBER) %>%
+  group_by(TXR_PLAYER_ID) %>%
+  mutate(APP_NUMBER = row_number(), .before = TXR_PLAYER_ID) %>%
+  mutate(CUR_PITCH_COUNT = coalesce(PITCH_COUNT_BACKUP, CUR_PITCH_COUNT),
+         BF = coalesce(BF, BF_BACKUP)) %>%
+  filter(n() >= 15) %>%
+  ungroup(TXR_PLAYER_ID) %>%
+  select(-c(PITCH_COUNT_BACKUP, BF_BACKUP))
+```
+
+
+```{r}
+players <- as.character(unique(gl_wl$TXR_PLAYER_ID))
+players_string <- toString(sprintf("'%s'", players))
+
+gl_all <- data.frame()
+gl_sub_data <- data.frame()
+
+# Perform numerous data manipulations to get a full the full 162 game sample for each qualified pitcher in 2023
+for (i in players) {
+  gl_sub_data <- gl_wl %>% filter(TXR_PLAYER_ID == i)
+  gl_player <- merge(run_diff_data, gl_sub_data, by = c("GAME_DATE", "GAME_NUMBER"), all.x = TRUE)
+  gl_player <- gl_player %>%
+    fill(PLAYER_NAME_LF, TXR_PLAYER_ID, GAME_YEAR, .direction = "downup") %>%
+    fill(TEAM_NAME, APP_NUMBER, ROLLING_P_APP, ROLLING_FB_VELO, ROLLING_SWM_RATE, ROLLING_FB_STUFF, ROLLING_XWOBA, ROLLING_K_RATE, ROLLING_BB_RATE, .direction = "down") %>%
+    fill(PITCH_COUNT_PREV_OUTING, PREV_DATE, PREV_GAME, .direction = "up") %>%
+    mutate(TEAM_NAME = replace_na(TEAM_NAME, first(na.omit(TEAM_NAME)))) %>%
+    group_by(GAME_DATE) %>%
+    filter(TEAM_NAME == P_TEAM_NAME) %>%
+    ungroup(GAME_DATE) %>%
+    group_by(APP_NUMBER) %>%
+    mutate(CUR_PITCH_COUNT = ifelse(APP_NUMBER == 1 & row_number() == 1, lead(PITCH_COUNT_PREV_OUTING), CUR_PITCH_COUNT),
+           PITCH_COUNT_PREV_OUTING = ifelse(APP_NUMBER == 1 & row_number() == 1, 0, PITCH_COUNT_PREV_OUTING)) %>%
+    ungroup(APP_NUMBER) %>%
+    mutate(OPPONENT_NAME = O_TEAM_NAME,
+           PITCHED_FLAG = ifelse(!is.na(CUR_PITCH_COUNT), 1, 0),
+           HOME_AWAY = as.factor(HOME_AWAY),
+           PITCH_COUNT_PREV_OUTING = ifelse(is.na(PITCH_COUNT_PREV_OUTING), last(na.omit(CUR_PITCH_COUNT)), PITCH_COUNT_PREV_OUTING),
+           CUR_PITCH_COUNT = ifelse(!is.na(CUR_PITCH_COUNT), CUR_PITCH_COUNT, 0),
+           BF = ifelse(!is.na(BF), BF, 0),
+           APP_NUMBER = replace_na(APP_NUMBER, 0),
+           PITCH_COUNT_PREV_OUTING = ifelse(APP_NUMBER == 0, 0, PITCH_COUNT_PREV_OUTING)) %>%
+    group_by(APP_NUMBER) %>%
+    mutate(START_DATE_7 = as.Date(ifelse(is.na(START_DATE_7), GAME_DATE - days(7), START_DATE_7)),
+           START_DATE_14 = as.Date(ifelse(is.na(START_DATE_14), GAME_DATE - days(14), START_DATE_14)),
+           REST_DAYS = as.numeric(ifelse(is.na(REST_DAYS), GAME_DATE - first(GAME_DATE) - 1, REST_DAYS))) %>%
+    mutate(REST_DAYS = ifelse(APP_NUMBER == 0, 99, ifelse(APP_NUMBER == 1 & row_number() == 1, 99, REST_DAYS)),
+           PREV_DATE = as.Date(ifelse(APP_NUMBER == 0, NA, ifelse(APP_NUMBER == 1 & row_number() == 1, NA, PREV_DATE))),
+           PREV_GAME = ifelse(APP_NUMBER == 0, NA, ifelse(APP_NUMBER == 1 & row_number() == 1, NA, PREV_GAME)),
+           DAYS_THROWN_LAST_7_DAYS = ifelse(APP_NUMBER == 1 & row_number() == 1, 0, DAYS_THROWN_LAST_7_DAYS),
+           PITCH_COUNT_LAST_7_DAYS = ifelse(APP_NUMBER == 1 & row_number() == 1, 0, PITCH_COUNT_LAST_7_DAYS),
+           DAYS_THROWN_LAST_14_DAYS = ifelse(APP_NUMBER == 1 & row_number() == 1, 0, DAYS_THROWN_LAST_14_DAYS),
+           PITCH_COUNT_LAST_14_DAYS = ifelse(APP_NUMBER == 1 & row_number() == 1, 0, PITCH_COUNT_LAST_14_DAYS))
+  gl_player <- merge(run_diff_opp, gl_player, by= c("GAME_DATE", "GAME_NUMBER", "O_TEAM_NAME"))
+  
+  # Add previous date if theres not one
+  num_app <- max(gl_player$APP_NUMBER)
+  gl_player <- gl_player %>%
+    group_by(APP_NUMBER) %>%
+    mutate(PREV_DATE = as.Date(ifelse(APP_NUMBER == num_app & is.na(PREV_DATE), first(GAME_DATE), PREV_DATE)),
+           PREV_GAME = ifelse(APP_NUMBER == num_app & is.na(PREV_GAME), first(GAME_NUMBER), PREV_GAME))
+  
+  # Fill 7 day workload numbers on rest days
+  for (j in 1:nrow(gl_player)) {
+    if (is.na(gl_player$DAYS_THROWN_LAST_7_DAYS[j])) {
+      sub = gl_player[gl_player$GAME_DATE >= gl_player$START_DATE_7[j] & gl_player$GAME_DATE <= gl_player$GAME_DATE[j],c(23, 35)]
+      gl_player$DAYS_THROWN_LAST_7_DAYS[j] = sum(sub$PITCHED_FLAG)
+      gl_player$PITCH_COUNT_LAST_7_DAYS[j] = sum(sub$CUR_PITCH_COUNT)
+    }
+  }
+
+  # Fill 14 day workload numbers on rest days
+  for (j in 1:nrow(gl_player)) {
+    if (is.na(gl_player$DAYS_THROWN_LAST_14_DAYS[j])) {
+      sub = gl_player[gl_player$GAME_DATE >= gl_player$START_DATE_14[j] & gl_player$GAME_DATE <= gl_player$GAME_DATE[j],c(23, 35)]
+      gl_player$DAYS_THROWN_LAST_14_DAYS[j] = sum(sub$PITCHED_FLAG)
+      gl_player$PITCH_COUNT_LAST_14_DAYS[j] = sum(sub$CUR_PITCH_COUNT)
+    }
+  }
+  
+  gl_player[, 'LEVERAGE_INDEX_LAST_7_DAYS'] = NA
+  
+  for (k in 1:nrow(gl_player)) {
+    sub = gl_player[gl_player$GAME_DATE >= gl_player$START_DATE_7[k] & gl_player$GAME_DATE <= gl_player$GAME_DATE[k],c(15, 24)]
+    gl_player$LEVERAGE_INDEX_LAST_7_DAYS[k] = round(weighted.mean(sub$LEVERAGE_INDEX, sub$BF, na.rm = TRUE), 2)
+  }
+
+  gl_all <- rbind(gl_all, gl_player)
+}
+
+# Ensure rolling averages update AFTER outing
+gl_all$PITCHED_FLAG <- as.factor(gl_all$PITCHED_FLAG)
+gl_all <- gl_all %>%
+  mutate(LEVERAGE_INDEX_LAST_7_DAYS = ifelse(is.nan(LEVERAGE_INDEX_LAST_7_DAYS), 1, LEVERAGE_INDEX_LAST_7_DAYS)) %>%
+  relocate(LEVERAGE_INDEX_LAST_7_DAYS, .after = LEVERAGE_INDEX) %>%
+  group_by(TXR_PLAYER_ID) %>%
+  mutate(LEVERAGE_INDEX_LAST_7_DAYS = ifelse(PITCHED_FLAG == 1, lag(LEVERAGE_INDEX_LAST_7_DAYS), LEVERAGE_INDEX_LAST_7_DAYS),
+         ROLLING_P_APP = ifelse(PITCHED_FLAG == 1, lag(ROLLING_P_APP), ROLLING_P_APP),
+         ROLLING_FB_VELO = ifelse(PITCHED_FLAG == 1, lag(ROLLING_FB_VELO), ROLLING_FB_VELO),
+         ROLLING_SWM_RATE = ifelse(PITCHED_FLAG == 1, lag(ROLLING_SWM_RATE), ROLLING_SWM_RATE),
+         ROLLING_FB_STUFF = ifelse(PITCHED_FLAG == 1, lag(ROLLING_FB_STUFF), ROLLING_FB_STUFF),
+         ROLLING_XWOBA = ifelse(PITCHED_FLAG == 1, lag(ROLLING_XWOBA), ROLLING_XWOBA),
+         ROLLING_K_RATE = ifelse(PITCHED_FLAG == 1, lag(ROLLING_K_RATE), ROLLING_K_RATE),
+         ROLLING_BB_RATE = ifelse(PITCHED_FLAG == 1, lag(ROLLING_BB_RATE), ROLLING_BB_RATE)) %>%
+  ungroup(TXR_PLAYER_ID)
+```
+
+
+```{r}
+il_query <- "select sub.rosterdate
+, sub.txr_player_id
+, SUM(sub.on_IL) OVER (partition by sub.txr_player_id ORDER BY sub.rosterdate ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS days_on_IL_last_14
+, sub.not_on_IL
+, sub.rehab_stint
+from
+	(select distinct edrdrp.rosterdate,
+	edrdrp.ebisplayerid,
+	txr.txr_player_id,
+	edrdrp.orgname,
+	edrdrp.rosterfirstname,
+	edrdrp.lastname,
+	epm.position,
+	edrdrp.majorleaguerosterstatusid,
+	edrdrp.minorleaguerosterstatusid,
+	case 
+		when edrdrp.majorleaguerosterstatusid in (56,57,58,59,60,61,62,63,65,66,73,76) then 1
+		when edrdrp.minorleaguerosterstatusid in (56,57,58,59,60,61,62,63,65,66,73,76) then 1
+		else 0 end as on_IL,
+	case 
+		when edrdrp.majorleaguerosterstatusid in (56,57,58,59,60,61,62,63,65,66,73,76) then 0
+		when edrdrp.minorleaguerosterstatusid in (56,57,58,59,60,61,62,63,65,66,73,76) then 0
+		else 1 end as not_on_IL,
+	case
+	  when edrdrp.majorleaguerosterstatusid in (60,61,62,63,66,74) then 1
+		when edrdrp.minorleaguerosterstatusid in (60,61,62,63,66,74) then 1
+		else 0 end as rehab_stint
+	from aws_pg.scout_migration.ebis_daily_roster_daily_roster_player edrdrp 
+	inner join aws_pg.scout_migration.ebis_player_master epm on epm.playerid = edrdrp.ebisplayerid 
+	inner join (
+		select distinct txr_player_id, ebis_id
+		from aws_pg.front_office.player_lookup pl
+		where is_pitcher = true
+		and ebis_id is not null
+		order by txr_player_id
+	) txr on txr.ebis_id = epm.playerid
+	where rosterdate >= concat(cast(cast(%s as int) - 1 as string), '-03-01') and rosterdate <= concat(cast(cast(%s as int) - 1 as string), '-11-10')
+		and epm.position in ('RHS','LHS','RHR','LHR','Right Handed Pitcher','Left Handed Pitcher','Switch Handed Starter','Two Way Player')
+		and edrdrp.ebisorgid between 1 and 32
+		and txr.txr_player_id in (%s)
+		order by txr.txr_player_id, rosterdate) sub"
+
+il_query <- sprintf(il_query, current_year, current_year, players_string)
+
+il_data <- SparkR::sql(il_query) %>%
+  SparkR::as.data.frame() %>%
+  group_by(txr_player_id) %>%
+  mutate(
+    change = not_on_IL != lag(not_on_IL, default = first(not_on_IL)),
+    index = cumsum(change)
+  ) %>%
+  ungroup() %>%
+  group_by(txr_player_id, index) %>%
+  mutate(days_since_IL = row_number()) %>%
+  ungroup() %>%
+  mutate(days_since_IL = ifelse(not_on_IL == 0, 0, days_since_IL)) %>%
+  mutate(days_since_IL = ifelse(index == 0, 99, days_since_IL)) %>%
+  select(-c(not_on_IL, change, index))
+
+gl_all <- merge(gl_all, il_data, by.x = c("TXR_PLAYER_ID", "GAME_DATE"), by.y = c("txr_player_id", "rosterdate")) %>%
+  relocate(TXR_PLAYER_ID, .before = PLAYER_NAME_LF) %>%
+  relocate(PITCHED_FLAG, .after = days_since_IL)
+```
+
+
+```{r}
+# Prepare data for training
+data <- gl_all %>%
+  drop_na(ROLLING_FB_VELO) %>%
+  mutate(HOME_AWAY = ifelse(HOME_AWAY == 'Home', 1, 0),
+         PITCHED_FLAG = ifelse(PITCHED_FLAG == 1, 1, 0))
+
+train_data = data[, c(4:5, 7, 16:23, 28:29, 31:32, 34:39)]
+dtrain = xgb.DMatrix(data = as.matrix(train_data[,-ncol(train_data)]), label = train_data$PITCHED_FLAG)
+```
+
+
+```{r}
+# Use grid search CV on training set
+train_control <- trainControl(method = "cv", number = 10, search = "grid")
+
+# Define xgboost parameters to be tested in grid search
+gbmGrid <-  expand.grid(max_depth = c(5,6,7), 
+                        nrounds = c(400,500,600),    # number of trees
+                        eta = c(0.1, 0.015, 0.01),
+                        gamma = 0,
+                        subsample = 1,
+                        min_child_weight = 1,
+                        colsample_bytree = 0.6)
+set.seed(1)
+model = train(x = as.matrix(train_data[,-ncol(train_data)]), 
+              y = train_data$PITCHED_FLAG, 
+              method = "xgbTree", 
+              trControl = train_control,
+              tuneGrid = gbmGrid)
+
+# Summarise the results
+print(model)
+
+# Create final model
+set.seed(1)
+final_model <- xgboost(data = dtrain, max_depth = model$bestTune$max_depth, eta = model$bestTune$eta,
+                       gamma = model$bestTune$gamma, colsample_bytree = model$bestTune$colsample_bytree,
+                       min_child_weight = model$bestTune$min_child_weight, nrounds = model$bestTune$nrounds,
+                       objective = "binary:logistic", monotone_constraints = c(0,0,0,0,0,0,0,0,0,0,0,0,1,-1,0,0,0,-1,0,1))
+
+```
+
+
+```{r}
+# Create experiment
+with(mlflow_start_run(experiment_id="EXPERIMENT_ID"), {
+predictor <- carrier::crate(function(x, ...) stats::predict(!!final_model, newdata = x, ...))
+mlflow_log_model(predictor, "Availability_Model")
+})
+```
