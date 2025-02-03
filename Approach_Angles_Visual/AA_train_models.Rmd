@@ -1,0 +1,104 @@
+
+---
+title: "AA_train_models"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+# Install packages and load libraries
+install.packages("mlflow")
+install.packages("carrier")
+```
+
+
+```{r}
+# Load Libraries
+library(mlflow)
+library(carrier)
+library(dplyr)
+```
+
+
+```{r}
+# Query train data
+comp_level_string = toString(sprintf("'%s'", 'MLB'))
+train_query <- "SELECT PITCHER_NAME_LAST_FIRST
+  , PITCHER_TXR_PLAYER_ID
+  , PITCHER_THROWS
+  , PITCH_TYPE
+  , RELEASE_SPEED 
+  , PITCH_RELEASE_COORDINATES_Z
+  , PITCH_RELEASE_COORDINATES_X
+  , EXTENSION 
+  , PITCH_LOCATION_HEIGHT_Z 
+  , PITCH_LOCATION_SIDE_X
+  , INDUCED_VERTICAL_BREAK
+  , HORIZONTAL_BREAK
+  , VERTICAL_APPROACH_ANGLE
+  , HORIZONTAL_APPROACH_ANGLE 
+  FROM snowflake.rpt.VIEW_WHEELHOUSE_PITCHES_MERGE 
+  WHERE HOME_COMPETITION_LEVEL_ABBREV = %s
+  AND YEAR = YEAR(CURDATE()) - 1
+  AND IS_PITCH = TRUE
+  AND GAME_TYPE_CODE = 'R'
+  AND RELEASE_SPEED IS NOT NULL 
+  AND (HAS_TRACKMAN
+      OR HAS_HAWKEYE
+      OR HAS_STATCAST
+      OR HAS_HAWKEYE_MINORS)"
+
+  train_query <- sprintf(train_query, comp_level_string)
+
+  train_data <- SparkR::sql(train_query) %>%
+    SparkR::as.data.frame()
+
+  train_data <- train_data %>% group_by(PITCHER_TXR_PLAYER_ID) %>% filter(n() >= 75) %>% ungroup(PITCHER_TXR_PLAYER_ID) %>%
+    mutate(across(where(is.numeric), ~ ifelse(abs(as.numeric(scale(.x))) > 3, NA, .x)))
+  train_data <- as.data.frame(na.omit(train_data))
+
+# Flips pitcher handedness so all horizontal characteristics will be on same scale
+  train_flip <- train_data %>%
+    mutate(PITCH_RELEASE_COORDINATES_X = ifelse(PITCHER_THROWS == 'L', PITCH_RELEASE_COORDINATES_X, -PITCH_RELEASE_COORDINATES_X),
+          PITCH_LOCATION_SIDE_X = ifelse(PITCHER_THROWS == 'L', PITCH_LOCATION_SIDE_X, -PITCH_LOCATION_SIDE_X),
+          HORIZONTAL_BREAK = ifelse(PITCHER_THROWS == 'L', HORIZONTAL_BREAK, -HORIZONTAL_BREAK),
+          HORIZONTAL_APPROACH_ANGLE = ifelse(PITCHER_THROWS == 'L', HORIZONTAL_APPROACH_ANGLE, -HORIZONTAL_APPROACH_ANGLE))
+  
+
+```
+
+
+```{r}
+# Run lm for VAA
+set.seed(5)
+model_vaa = lm(VERTICAL_APPROACH_ANGLE ~ .,data = train_flip[,c(5:6,8:9,11,13)]) 
+
+```
+
+
+```{r}
+# Run lm for HAA
+set.seed(5)
+model_haa = lm(HORIZONTAL_APPROACH_ANGLE ~ .,data = train_flip[,c(5,7:8,10,12,14)]) 
+
+```
+
+
+```{r}
+# Create VAA experiment
+with(mlflow_start_run(experiment_id="EXPERIMENT_ID"), {
+predictor <- carrier::crate(function(x, ...) stats::predict(!!model_vaa, newdata = x, ...))
+mlflow_log_model(predictor, "VAA_model")
+})
+```
+
+
+```{r}
+# Create HAA experiment
+with(mlflow_start_run(experiment_id="EXPERIMENT_ID"), {
+predictor <- carrier::crate(function(x, ...) stats::predict(!!model_haa, newdata = x, ...))
+mlflow_log_model(predictor, "HAA_model")
+})
+```

@@ -1,0 +1,445 @@
+
+---
+title: "Approach_Angle_Visuals"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+devtools::install_github("texas-rangers-baseball-club/rangeRs", auth_token = "TOKEN")
+```
+
+
+```{r}
+# Install necessary packages
+install.packages(c("slackr", "tidyr", "zoo", "lubridate", "caret", "vctrs"))
+```
+
+
+```{r}
+# Load Libraries
+library(slackr)
+library(dplyr)
+library(tidyr)
+library(zoo)
+library(lubridate)
+library(caret)
+library(ggplot2)
+library(scales)
+library(mlflow)
+library(rangeRs)
+```
+
+
+```{r}
+# Load VAA model from MLFlow
+vaa_model_load <- mlflow_load_model('MODEL_ARTIFACT')
+```
+
+
+```{r}
+# Load HAA model from MLFlow
+haa_model_load <- mlflow_load_model('MODEL_ARTIFACT')
+```
+
+
+```{r}
+# Function for Rangers' pitch colors hex codes
+rangers_pitch_colors <- function() {
+  pcs <-
+    c(
+      "Fastball" = "#D22D49",
+      "4-Seam Fastball" = "#D22D49", # Unnecessary
+      "Sinker" = "#FE9D00",
+      "2-Seam Fastball" = "#DE6A04",
+      "Cutter" = "#933F2C",
+
+      "Curveball" = "#00D1ED",
+      "Knuckle Curve" = "#6236CD",
+      "Slider" = "#A39E0C",
+      "Sweeper" = "#888888",
+
+      "Changeup" = "#1DBE3A",
+      "Splitter" = "#3BACAC",
+      "Screwball" = "#60DB33",
+      "Forkball" = "#55CCAB",
+
+      "Knuckleball" = "#3C44CD",
+
+      "Eephus Pitch" = "#888888",
+      "Eephus" = "#888888", # Unnecessary
+      "Unknown" = "black",
+      "Intentional Ball" = "black"
+    )
+  return(pcs)
+}
+```
+
+
+```{r}
+
+# Function that queries active pitchers from specified team
+get_players <- function(team) {
+  team_abbrev <- team
+  team_abbrev_string <- toString(sprintf("'%s'", team_abbrev))
+  players_query <- "select display_last_first_name, txr_player_id, team_name, org, sport_code_name
+  from aws_pg.front_office.player_lookup pl
+  where team_name = %s
+  and sport_code_name in ('A','A+','AA','AAA','MLB')
+  and is_pitcher = TRUE
+  and coalesce(minor_roster_status, major_roster_status) = 'ACT'
+  order by sport_code_name, display_last_first_name"
+
+  players_query <- sprintf(players_query, team_abbrev_string)
+
+  players_data <- SparkR::sql(players_query) %>%
+    SparkR::as.data.frame()
+  
+  return(players_data)
+}
+```
+
+
+```{r}
+# Function to get competition level
+get_comp_level <- function(df) {
+  comp_level = first(df$sport_code_name)
+  return(comp_level)
+}
+```
+
+
+```{r}
+# Function to query all AA data from comp level and adjust for zone location
+get_aa_data_comp_level <- function(comp_level) {
+  comp_level_string = toString(sprintf("'%s'", comp_level))
+  aa_query <- "SELECT PITCHER_NAME_LAST_FIRST
+  , PITCHER_TXR_PLAYER_ID
+  , PITCHER_THROWS
+  , PITCH_TYPE AS PITCH
+  , RELEASE_SPEED 
+  , PITCH_RELEASE_COORDINATES_Z
+  , PITCH_RELEASE_COORDINATES_X
+  , EXTENSION 
+  , PITCH_LOCATION_HEIGHT_Z 
+  , PITCH_LOCATION_SIDE_X
+  , INDUCED_VERTICAL_BREAK
+  , HORIZONTAL_BREAK
+  , VERTICAL_APPROACH_ANGLE
+  , HORIZONTAL_APPROACH_ANGLE
+  FROM snowflake.rpt.VIEW_WHEELHOUSE_PITCHES_MERGE
+  WHERE HOME_COMPETITION_LEVEL_ABBREV = %s
+  AND YEAR IN (YEAR(CURDATE()) - 1, YEAR(CURDATE()))
+  AND IS_PITCH = TRUE
+  AND GAME_TYPE_CODE = 'R'
+  AND RELEASE_SPEED IS NOT NULL 
+  AND (HAS_TRACKMAN
+      OR HAS_HAWKEYE
+      OR HAS_STATCAST
+      OR HAS_HAWKEYE_MINORS)"
+
+  aa_query <- sprintf(aa_query, comp_level_string)
+
+  aa_data <- SparkR::sql(aa_query) %>% SparkR::as.data.frame()
+
+  aa_data <- aa_data %>% filter(!(PITCH %in% c('Eephus Pitch','Intentional Ball', 'Unknown', 'No Tag'))) %>%
+    mutate(PITCH = ifelse(PITCH == 'Fastball', '4-Seam Fastball', PITCH))
+  aa_data <- aa_data %>% group_by(PITCHER_TXR_PLAYER_ID) %>% filter(n() >= 75) %>% ungroup(PITCHER_TXR_PLAYER_ID) %>% 
+    mutate(across(where(is.numeric), ~ ifelse(abs(as.numeric(scale(.x))) > 5, NA, .x)))
+  aa_data <- as.data.frame(na.omit(aa_data))
+
+# Flips pitcher handedness so all horizontal characteristics will be on same scale
+  aa_flip <- aa_data %>%
+  mutate(PITCH_RELEASE_COORDINATES_X = ifelse(PITCHER_THROWS == 'L', PITCH_RELEASE_COORDINATES_X, -PITCH_RELEASE_COORDINATES_X),
+         PITCH_LOCATION_SIDE_X = ifelse(PITCHER_THROWS == 'L', PITCH_LOCATION_SIDE_X, -PITCH_LOCATION_SIDE_X),
+         HORIZONTAL_BREAK = ifelse(PITCHER_THROWS == 'L', HORIZONTAL_BREAK, -HORIZONTAL_BREAK),
+         HORIZONTAL_APPROACH_ANGLE = ifelse(PITCHER_THROWS == 'L', HORIZONTAL_APPROACH_ANGLE, -HORIZONTAL_APPROACH_ANGLE),
+         PITCH_LOCATION_HEIGHT_Z = 2.5,
+         PITCH_LOCATION_SIDE_X = 0)
+
+# Adjusts AA data for zone location from trained model
+  Zone_Adj_VAA = aa_flip[,c(5:6,8:9,11)] %>% vaa_model_load()
+  Zone_Adj_HAA = aa_flip[,c(5,7:8,10,12)] %>% haa_model_load()
+
+  aa_flip <- cbind(aa_flip, Zone_Adj_VAA, Zone_Adj_HAA)
+  aa_flip <- aa_flip %>% select(-c(PITCH_LOCATION_HEIGHT_Z, PITCH_LOCATION_SIDE_X))
+
+  return(aa_flip)
+}
+```
+
+
+```{r}
+# Function to get player specific AA data and adjust for zone location
+get_aa_data_players <- function(df) {
+	players <- df$txr_player_id
+	players_string <- toString(sprintf("'%s'", players))
+
+	aa_players_query <- "SELECT PITCHER_NAME_LAST_FIRST
+	, PITCHER_TXR_PLAYER_ID
+	, PITCHER_THROWS
+	, PITCH_TYPE AS PITCH
+	, RELEASE_SPEED 
+	, PITCH_RELEASE_COORDINATES_Z
+	, PITCH_RELEASE_COORDINATES_X
+	, EXTENSION 
+	, PITCH_LOCATION_HEIGHT_Z 
+	, PITCH_LOCATION_SIDE_X
+	, INDUCED_VERTICAL_BREAK
+	, HORIZONTAL_BREAK
+	, VERTICAL_APPROACH_ANGLE
+	, HORIZONTAL_APPROACH_ANGLE
+	FROM snowflake.rpt.VIEW_WHEELHOUSE_PITCHES_MERGE
+		INNER JOIN (SELECT TXR_PLAYER_ID, PLAYER_NAME_FL
+					FROM snowflake.rpt.VIEW_GAME_LOG_PITCHING
+					GROUP BY TXR_PLAYER_ID, PLAYER_NAME_FL) ON PITCHER_TXR_PLAYER_ID = TXR_PLAYER_ID 
+	WHERE PITCHER_TXR_PLAYER_ID IN (%s)
+	AND HOME_COMPETITION_LEVEL_ABBREV IN ('Rk','A','A+','AA','AAA','MLB')
+	AND YEAR IN (YEAR(CURDATE()) - 1, YEAR(CURDATE()))
+	AND IS_PITCH = TRUE
+	AND GAME_TYPE_CODE = 'R'
+	AND RELEASE_SPEED IS NOT NULL 
+	AND (HAS_TRACKMAN
+			OR HAS_HAWKEYE
+			OR HAS_STATCAST
+			OR HAS_HAWKEYE_MINORS)"
+
+	aa_players_query <- sprintf(aa_players_query, players_string)
+
+	aa_players_data <- SparkR::sql(aa_players_query) %>% SparkR::as.data.frame()
+
+	aa_players_data <- aa_players_data %>% filter(!(PITCH %in% c('Eephus Pitch','Intentional Ball', 'Unknown', 'No Tag'))) %>%
+		mutate(PITCH = ifelse(PITCH == 'Fastball', '4-Seam Fastball', PITCH))
+	aa_players_data <- aa_players_data %>% group_by(PITCHER_TXR_PLAYER_ID) %>% filter(n() >= 75) %>% ungroup(PITCHER_TXR_PLAYER_ID) %>% 
+		mutate(across(where(is.numeric), ~ ifelse(abs(as.numeric(scale(.x))) > 5, NA, .x)))
+	aa_players_data <- as.data.frame(na.omit(aa_players_data))
+
+# Flips pitcher handedness so all horizontal characteristics will be on same scale
+	aa_players_flip <- aa_players_data %>%
+		mutate(PITCH_RELEASE_COORDINATES_X = ifelse(PITCHER_THROWS == 'L', PITCH_RELEASE_COORDINATES_X, -PITCH_RELEASE_COORDINATES_X),
+					PITCH_LOCATION_SIDE_X = ifelse(PITCHER_THROWS == 'L', PITCH_LOCATION_SIDE_X, -PITCH_LOCATION_SIDE_X),
+					HORIZONTAL_BREAK = ifelse(PITCHER_THROWS == 'L', HORIZONTAL_BREAK, -HORIZONTAL_BREAK),
+					HORIZONTAL_APPROACH_ANGLE = ifelse(PITCHER_THROWS == 'L', HORIZONTAL_APPROACH_ANGLE, -HORIZONTAL_APPROACH_ANGLE),
+					PITCH_LOCATION_HEIGHT_Z = 2.5,
+					PITCH_LOCATION_SIDE_X = 0)
+
+# Adjusts AA data for zone location from trained model
+	Zone_Adj_VAA = aa_players_flip[,c(5:6,8:9,11)] %>% vaa_model_load()
+	Zone_Adj_HAA = aa_players_flip[,c(5,7:8,10,12)] %>% haa_model_load()
+
+	aa_players_flip <- cbind(aa_players_flip, Zone_Adj_VAA, Zone_Adj_HAA)
+	aa_players_flip <- aa_players_flip %>% select(-c(PITCH_LOCATION_HEIGHT_Z, PITCH_LOCATION_SIDE_X))
+
+	return(aa_players_flip)
+}
+```
+
+
+```{r}
+# Function that averages the AA of each pitcher's pitch types
+get_aa_avg_players <- function(df) {
+  aa_players_avg <- df %>%
+  group_by(PITCHER_TXR_PLAYER_ID, PITCHER_NAME_LAST_FIRST, PITCH) %>%
+  summarise(PITCHER_THROWS = PITCHER_THROWS[1],
+            COUNT = n(),
+            Zone_Adj_VAA = mean(Zone_Adj_VAA),
+            Zone_Adj_HAA = mean(Zone_Adj_HAA)) %>%
+  ungroup(PITCHER_TXR_PLAYER_ID, PITCHER_NAME_LAST_FIRST, PITCH) %>%
+  filter(COUNT >= 10) %>%
+  mutate(PITCHER_NAME_LAST_FIRST = clean_player_names(PITCHER_NAME_LAST_FIRST)) %>%
+  rename(PITCHER_NAME_FL = PITCHER_NAME_LAST_FIRST) %>%
+  arrange(PITCHER_TXR_PLAYER_ID, PITCHER_NAME_FL)
+
+  return(aa_players_avg)
+}
+
+```
+
+
+```{r}
+# Function to get pitcher ids
+get_pitcher_names <- function(df) {
+  pitchers <- unique(df$PITCHER_TXR_PLAYER_ID)
+}
+```
+
+
+```{r}
+# Function to create a pdf for each team containing AA visuals for every pitcher
+make_pdfs <- function(team, pitchers, player_avg, comp_level_data, comp_level) {
+  filename_team = gsub(' ','_', team)
+
+# Set directory
+  mainDir <- "/LOCAL_DIRECTIORY/"
+  subDir <- filename_team
+
+  if (file.exists(subDir)){
+      setwd(file.path(mainDir, subDir))
+  } else {
+      dir.create(file.path(mainDir, subDir))
+      setwd(file.path(mainDir, subDir))
+  }
+
+  plots_list <- list()
+
+# Iterate through each pitcher
+  for (i in pitchers) {
+    pitcher = i
+    pitch_types = player_avg %>%
+      filter(PITCHER_TXR_PLAYER_ID == pitcher) %>%
+      select(PITCH, COUNT, PITCHER_THROWS)
+    pitch_hand = pitch_types[[1, 'PITCHER_THROWS']]
+    pitch_types = pitch_types[['PITCH']]
+    
+    aa_players_by_hand_avg <- player_avg %>% filter(PITCHER_TXR_PLAYER_ID == pitcher)
+    aa_by_hand_flip <- comp_level_data %>% filter(PITCH %in% pitch_types)
+    pitcher_name <- aa_players_by_hand_avg$PITCHER_NAME_FL[1]
+    note = " "
+
+# Flip lefties back to original side
+    if (pitch_hand == "L") {
+      aa_players_by_hand_avg$Zone_Adj_HAA = aa_players_by_hand_avg$Zone_Adj_HAA * -1
+      aa_by_hand_flip$Zone_Adj_HAA = aa_by_hand_flip$Zone_Adj_HAA * -1
+    }
+
+    if (pitch_hand == "L") {
+      xlim_values = c(-5, 1)
+    } else {
+      xlim_values = c(-1, 5)
+    }
+
+    if (pitch_hand == "R" & max(aa_players_by_hand_avg$Zone_Adj_HAA) >= 5) {
+      xlim_values[2] = max(aa_players_by_hand_avg$Zone_Adj_HAA + 0.5)
+      note = "Note: Axes scaled to show pitcher averages"
+    }
+    
+    if (pitch_hand == "L" & min(aa_players_by_hand_avg$Zone_Adj_HAA) <= -5) {
+      xlim_values[1] = min(aa_players_by_hand_avg$Zone_Adj_HAA - 0.5)
+      note = "Note: Axes scaled to show pitcher averages"
+    }
+    
+    ylim_values <- c(-10.5,-4)
+    
+    if (min(aa_players_by_hand_avg$Zone_Adj_VAA) <= -10.5) {
+      ylim_values[1] = min(aa_players_by_hand_avg$Zone_Adj_VAA - 0.5)
+      note = "Note: Axes scaled to show pitcher averages"
+    } 
+    if (max(aa_players_by_hand_avg$Zone_Adj_VAA) >= -4) {
+      ylim_values[2] = max(aa_players_by_hand_avg$Zone_Adj_VAA + 0.5)
+      note = "Note: Axes scaled to show pitcher averages"
+    } 
+  
+    n = length(unique(pitch_types))
+    cols = hue_pal()(n)
+
+# Use ggplot to create visual. "geom_point" plots each pitch average and "stat_ellipse" plots the confidence ellipse for that pitch at the comp level    
+    p <- ggplot(aa_players_by_hand_avg, aes(x = Zone_Adj_HAA, y = Zone_Adj_VAA)) +
+      geom_point(data = aa_players_by_hand_avg, aes(fill = PITCH), shape = 21, size = 6) +
+      stat_ellipse(data = aa_by_hand_flip, aes(color = PITCH), level = 0.8, size = 0.75) +
+      xlim(xlim_values[1], xlim_values[2]) +
+      ylim(ylim_values[1], ylim_values[2]) +
+      scale_color_manual(values = rangers_pitch_colors()) +
+      scale_fill_manual(values = rangers_pitch_colors()) +
+      labs(title = paste0(pitcher_name, ' (', pitch_hand,'): ', "Pitch Approach Angles"),
+          subtitle = paste0(as.numeric(format(Sys.Date(), "%Y")) - 1, "/", as.numeric(format(Sys.Date(), "%Y")), " Data - Catcher's Perspective"),
+          caption = note,
+          color = 'League Wide Ranges', fill = 'Pitcher Average') +
+      xlab("Zone Adjusted HAA") +
+      ylab("Zone Adjusted VAA") +
+      theme_bw() +
+      theme(panel.grid.major = element_line(linetype = 'dashed', color = '#cccccc')) +
+      theme(panel.grid.minor = element_line(linetype = 'dashed', color = '#cccccc')) +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"), plot.subtitle = element_text(hjust = 0.5, face = "italic"), plot.caption = element_text(hjust = 1.5, face = "italic"))
+
+    plots_list[[i]] <- p
+  }
+
+  pdf(paste0(mainDir, subDir, "/", filename_team, "_",comp_level,"_",Sys.Date() + 1,".pdf"), width = 8, height = 8)
+
+  for(p in plots_list) {
+    print(p)
+  }
+
+  dev.off()
+
+# Variable containing appropriate Slack channel
+  channel = ifelse(comp_level == 'AAA', "advance_report_aaa", ifelse(comp_level == 'AA', "advance_report_aa", ifelse(comp_level == 'A+', "advance_report_high_a", ifelse(comp_level == 'A', "advance_report_low_a", "approach_angles_test"))))
+
+# Slackr credentials
+  SLACK_TOKEN = "TOKEN"
+  SLACK_URL = "URL"
+  SLACK_CHANNEL = channel
+
+  slackr_setup(token = SLACK_TOKEN, incoming_webhook_url = SLACK_URL)
+
+# Send to appropriate Slack channel
+  slackr_upload(filename = paste0(mainDir, "/", subDir, "/", filename_team, "_",comp_level,"_",Sys.Date() + 1,".pdf"), 
+                title = paste0(team, ' (',comp_level,')'),
+                initial_comment =  paste0("Weekly Approach Angles (", Sys.Date() + 1,")"),
+                channels = SLACK_CHANNEL, 
+                token = SLACK_TOKEN,
+                thread_ts = NULL)
+}
+
+```
+
+
+```{r}
+# Query opponents for the upcoming week
+teams_query <- "select distinct(HOME_TEAM_NAME) as Opponent
+from silver.statsapi.schedules
+where AWAY_TEAM_NAME IN ('Round Rock Express', 'Frisco RoughRiders', 'Hickory Crawdads', 'Down East Wood Ducks')
+and GAME_DATE >= current_date() + 2 and GAME_DATE <= current_date() + 7
+union
+select distinct(AWAY_TEAM_NAME) as Opponent
+from silver.statsapi.schedules
+where HOME_TEAM_NAME IN ('Round Rock Express', 'Frisco RoughRiders', 'Hickory Crawdads', 'Down East Wood Ducks')
+and GAME_DATE >= current_date() + 2 and GAME_DATE <= current_date() + 7"
+
+team_names <- SparkR::sql(teams_query) %>% SparkR::as.data.frame()
+
+team_names_list <- team_names$Opponent
+```
+
+
+```{r}
+# Main function to run all above functions
+create_aa_visual <- function(team) {
+  players_data <- get_players(team)
+  comp_level <- get_comp_level(players_data)
+  aa_data_comp_level <- get_aa_data_comp_level(comp_level)
+  aa_data_players <- get_aa_data_players(players_data)
+  aa_players_avg <- get_aa_avg_players(aa_data_players)
+  pitchers <- get_pitcher_names(aa_players_avg)
+  pdf_bundle <- make_pdfs(team, pitchers, aa_players_avg, aa_data_comp_level, comp_level)
+}
+```
+
+
+```{r}
+# Use lapply to run the main function for each opponent
+lapply(team_names_list, create_aa_visual)
+```
+
+
+```{r}
+# list files or directories in working directory  
+list.files(path=".", pattern=NULL, all.files=FALSE, full.names=FALSE) 
+  
+# Function to remove each team directory one at a time
+remove_team <- function(team) {
+    filename_team = gsub(' ','_', team)
+    system(paste0("rm -r /LOCAL_DIRECTORY/", filename_team), 
+    intern = TRUE)
+}
+
+# delete the team directories
+lapply(team_names_list, remove_team)
+  
+# list files or directories in working directory  
+# after deletion 
+list.files(path=".", pattern=NULL, all.files=FALSE, 
+    full.names=FALSE)
+```
