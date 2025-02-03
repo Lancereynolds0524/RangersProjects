@@ -1,0 +1,355 @@
+
+---
+title: "Performance_by_Count_Table"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+install.packages(c("htmltools","rlang"))
+```
+
+
+```{bash}
+sudo apt-get update
+```
+
+```{bash}
+sudo apt-get --yes install libmagick++-dev --fix-missing
+```
+
+```{r}
+devtools::install_github("camdenk/mlbplotR")
+```
+
+
+```{bash}
+sh /Workspace/Shared/gt-init-script.sh
+```
+
+```{r}
+install.packages(c("vctrs","gt","webshot2","slackr"))
+```
+
+
+```{r}
+devtools::install_github("texas-rangers-baseball-club/rangeRs", auth_token = "TOKEN")
+```
+
+
+```{r}
+# load libraries
+library(dplyr)
+library(slackr)
+library(tidyr)
+library(gt)
+library(mlbplotR)
+library(rangeRs)
+library(webshot2)
+```
+
+
+```{r}
+# function to get active pitchers from desired team
+get_players <- function(opponent) {
+  
+  opponent_string <- toString(sprintf("'%s'", opponent))
+  
+  players_query <- "select display_last_first_name, txr_player_id, team_name, org, sport_code_name
+  from aws_pg.front_office.player_lookup
+  where team_name = %s
+  and sport_code_name in ('A','A+','AA','AAA','MLB')
+  and is_pitcher = TRUE
+  and coalesce(minor_roster_status, major_roster_status) = 'ACT'
+  order by sport_code_name, display_last_first_name"
+  
+  players_query <- sprintf(players_query, opponent_string)
+  players_data <- SparkR::sql(players_query) %>%
+      SparkR::as.data.frame()
+  
+  return(players_data)
+}
+```
+
+
+```{r}
+# function to get desired competition level
+get_comp_level <- function(players) {
+  comp_vec <- players$sport_code_name[1]
+  
+  return(comp_vec)
+}
+```
+
+
+```{r}
+# function to get start % and filter out only pitchers who have started at least one game in current year
+get_starters <- function(players) {
+  players_vec <- players$txr_player_id
+  players_string <- toString(sprintf("'%s'", players_vec))
+  
+  starter_query <- "SELECT PITCHER_NAME_LAST_FIRST, PITCHER_TXR_PLAYER_ID, round(sum(CAST(IS_STARTING_PITCHER AS int)) * 100 / COUNT(*), 1) AS start_per, YEAR
+  FROM snowflake.rpt.VIEW_WHEELHOUSE_PITCHES_MERGE 
+  WHERE YEAR = YEAR(CURDATE())
+  AND HOME_COMPETITION_LEVEL_ABBREV IN ('A','A+','AA','AAA','MLB')
+  AND GAME_TYPE_CODE = 'R'
+  AND PITCHER_PITCH_COUNT = 1
+  AND PITCHER_TXR_PLAYER_ID IN (%s)
+  GROUP BY PITCHER_NAME_LAST_FIRST, PITCHER_TXR_PLAYER_ID, YEAR
+  ORDER BY start_per"
+  
+  starter_query <- sprintf(starter_query, players_string)
+  starter_data <- SparkR::sql(starter_query) %>%
+      SparkR::as.data.frame()
+  
+  starter_data <- starter_data %>% filter(start_per > 0)
+  starter_vec <- starter_data$PITCHER_TXR_PLAYER_ID
+  
+  return(starter_vec)
+}
+```
+
+
+```{r}
+# function merges desired team's pitcher info and xwOBA by count together
+get_team_df <- function(players, pitcher_perf_by_count, starters) {
+  pitcher_team <- merge(players, pitcher_perf_by_count, by.x = c('txr_player_id'), by.y = c('TXRPlayerID'))
+
+# clean up column names, filter only starters, and flip name convention to first last
+  pitcher_team <- pitcher_team %>% 
+  arrange(txr_player_id, LATEST_GAME) %>%
+    group_by(txr_player_id) %>%
+    mutate(qualifies = ifelse(sport_code_name %in% HOME_COMPETITION_LEVEL_ABBREV, 1, 0)) %>%
+    filter(HOME_COMPETITION_LEVEL_ABBREV == sport_code_name | qualifies == 0) %>%
+    filter(row_number() == n()) %>%
+    ungroup(txr_player_id) %>%
+    mutate(HOME_COMPETITION_LEVEL_ABBREV = ifelse(HOME_COMPETITION_LEVEL_ABBREV == sport_code_name, 
+                                                  HOME_COMPETITION_LEVEL_ABBREV,
+                                                  paste0(HOME_COMPETITION_LEVEL_ABBREV, " *"))) %>%
+    rename(Pitcher = display_last_first_name,
+           TXRPlayerID = txr_player_id,
+           MLBPlayerID = MLBPlayerID,
+           Team = team_name,
+           Org = org,
+           Level = HOME_COMPETITION_LEVEL_ABBREV,
+           Total_Pitches = Total_Pitches) %>%
+    relocate(MLBPlayerID, .before = TXRPlayerID) %>%
+    relocate(Level, .after = Org) %>%
+    arrange(Pitcher) %>%
+    filter(TXRPlayerID %in% starters) %>%
+    mutate(Pitcher = clean_player_names(Pitcher)) %>%
+    select(-c(sport_code_name, LATEST_GAME))
+  
+  return(pitcher_team)
+}
+```
+
+
+```{r}
+# function to create gt table
+make_table <- function(team_df, opponent, min_xwoba, mean_xwoba, max_xwoba, comp_level) {
+  pitch_wl <- team_df %>% select(-c(TXRPlayerID, Team, Org)) %>%
+  gt() %>%
+      tab_header(title = md("**Pitcher xwOBA by** ***Pitch Count***"),
+                 subtitle = md(opponent)) %>%
+      cols_label(MLBPlayerID = md(" "),
+                 Pitcher = md("**Pitcher**"),
+                 Level = md("**Level**"),
+                 Total_Pitches = md("**Total Pitches**"),
+                 `1-25` = md("**1-25**"), # each 25 pitch count bucket
+                 `26-50` = md("**26-50**"),
+                 `51-75` = md("**51-75**"),
+                 `76-100` = md("**76-100**")) %>%
+      cols_align(align = "center",
+                 columns = c(Level, Total_Pitches, `1-25`, `26-50`, `51-75`, `76-100`)) %>%
+      gt_fmt_mlb_dot_headshot(columns = "MLBPlayerID", height = 40) %>%
+      gt_theme_rangers() %>%
+      gt_color_pill(c(`1-25`:`76-100`), # color xwOBA tiles by ntile
+                    domain = c(min_xwoba, max_xwoba),
+                    midpoint = mean_xwoba,
+                    palette = c("#E4322E", "white", "#1193AE"),
+                    pill_height = 30,
+                    accuracy = 0.001) %>%
+      cols_width(MLBPlayerID ~ px(60),
+                 Pitcher ~ px(190),
+                 Level ~ px(80),
+                 Total_Pitches ~ px(120),
+                 `1-25` ~ px(80),
+                 `26-50` ~ px(80),
+                 `51-75` ~ px(80),
+                 `76-100` ~ px(80)) %>%
+      tab_footnote(
+        footnote =  md(paste0("*Data covers starts of 60+ pitches since *", as.numeric(format(Sys.Date(), "%Y")) - 1, "* for pitchers with at least 1 start in *", format(Sys.Date(), "%Y"), "* (min. 50 pitches/bucket).*"))
+      )  %>%
+      tab_footnote(
+        footnote = md(ifelse(0 %in% team_df$qualifies, "*\\* Indicates data comes from most recent qualifying comp. level.*", ""))
+      ) %>%
+      cols_hide(qualifies)
+  
+  filename_team = gsub(' ','_', opponent)
+
+  # create new directory (if one doesn't exist) and save the gt table as an image here
+  mainDir <- "/LOCAL_DIRECTORY/"
+  subDir <- file.path(mainDir, filename_team)
+  
+  if (!file.exists(subDir)) {
+    dir.create(subDir)
+  }
+  
+  pitch_wl %>% gtsave(filename = paste0(subDir,"/", filename_team, "_",comp_level,"_",Sys.Date() + 1,".png"), vwidth = 2000, vheight = 10, expand = 15)
+
+}
+```
+
+
+```{r}
+# function to send gt table image to appropriate Slack channel
+save_table <- function(table, opponent, comp_level) {
+  filename_team = gsub(' ','_', opponent)
+
+  mainDir <- "/LOCAL_DIRECTORY/"
+  subDir <- file.path(mainDir, filename_team)
+
+channel = ifelse(comp_level == 'AAA', "advance_report_aaa", ifelse(comp_level == 'AA', "advance_report_aa", ifelse(comp_level == 'A+', "advance_report_high_a", ifelse(comp_level == 'A', "advance_report_low_a", "approach_angles_test"))))
+
+# Slackr credentials
+  SLACK_TOKEN = "TOKEN"
+  SLACK_URL = "URL"
+  SLACK_CHANNEL = channel
+
+  slackr_setup(token = SLACK_TOKEN, incoming_webhook_url = SLACK_URL)
+
+# Send to appropriate Slack channel
+  slackr_upload(filename = paste0(subDir, "/", filename_team, "_",comp_level,"_",Sys.Date() + 1,".png"), 
+                title = paste0(opponent, ' (',comp_level,')'),
+                initial_comment =  paste0("Weekly Pitcher xwOBA by Pitch Count (", Sys.Date() + 1,")"),
+                channels = SLACK_CHANNEL, 
+                token = SLACK_TOKEN,
+                thread_ts = NULL)
+}
+```
+
+
+```{r}
+# function to delete team folders from workspace after sending
+remove_team <- function(opponent) {
+    filename_team = gsub(' ','_', opponent)
+    system(paste0("rm -r /LOCAL_DIRECTORY/", filename_team), 
+    intern = TRUE)
+}
+```
+
+
+```{r}
+# main function to bring all functions together and run for each team
+create_table <- function(opponent, pitcher_perf_by_count, min_xwoba, mean_xwoba, max_xwoba) {
+  player_df <- get_players(opponent)
+  comp <- get_comp_level(player_df)
+  starter_list <- get_starters(player_df)
+  team_df <- get_team_df(player_df, pitcher_perf_by_count, starter_list)
+  gt_table <- make_table(team_df, opponent, min_xwoba, mean_xwoba, max_xwoba, comp)
+  export_table <- save_table(gt_table, opponent, comp)
+  delete_table <- remove_team(opponent)
+}
+```
+
+
+```{r}
+# query xwOBA data by pitch count bucket for all pitchers since start of previous season (reg. season only)
+pitch_count_query <- "SELECT PITCHER_TXR_PLAYER_ID AS TXRPlayerID
+	    , PITCHER_MLB_PLAYER_ID AS MLBPlayerID
+	    , GAME_DATE
+      , HOME_COMPETITION_LEVEL_ABBREV
+			, ROW_NUMBER() OVER (PARTITION BY PITCHER_TXR_PLAYER_ID, GAME_DATE, GAME_NUMBER ORDER BY PITCH_PER_GAME) AS Pitch_Count
+			, XWOBA
+			, WOBA
+			, WOBA_DENOMINATOR
+			, IS_PLATE_APPEARANCE
+			FROM snowflake.rpt.VIEW_WHEELHOUSE_PITCHES_MERGE
+			WHERE HOME_COMPETITION_LEVEL_ABBREV IN ('A','A+','AA','AAA','MLB')
+			AND YEAR IN (YEAR(CURDATE()) - 1, YEAR(CURDATE()))
+			AND GAME_TYPE_CODE = 'R'
+			AND PITCHER_TXR_PLAYER_ID IS NOT NULL
+			AND IS_PITCH = TRUE
+			AND IS_STARTING_PITCHER = TRUE
+			AND (HAS_TRACKMAN
+					OR HAS_HAWKEYE
+					OR HAS_STATCAST
+					OR HAS_HAWKEYE_MINORS)
+      ORDER BY TXRPlayerID, GAME_DATE, Pitch_Count"
+
+pitch_count_data <- SparkR::sql(pitch_count_query) %>%
+      SparkR::as.data.frame()
+```
+
+
+```{r}
+# df to create pitch count buckets and calculate xwOBAs for each bucket
+pitch_count_buckets <- pitch_count_data %>%
+  group_by(TXRPlayerID, GAME_DATE) %>%
+  filter(n() >= 60) %>% # filter starts of 60+ pitches
+  ungroup(TXRPlayerID, GAME_DATE) %>%
+  mutate(Pitch_Bucket = case_when(
+    Pitch_Count >= 1 & Pitch_Count <= 25 ~ '1-25',
+	  Pitch_Count >= 26 & Pitch_Count <= 50 ~ '26-50',
+	  Pitch_Count >= 51 & Pitch_Count <= 75 ~ '51-75',
+	  Pitch_Count >= 76 & Pitch_Count <= 100 ~ '76-100',
+    TRUE ~ NA)
+  ) %>%
+  group_by(TXRPlayerID, MLBPlayerID, HOME_COMPETITION_LEVEL_ABBREV, Pitch_Bucket) %>%
+  summarise(Total_Pitches = n(),
+            XWOBA_Bucket = ifelse(sum(WOBA_DENOMINATOR, na.rm = TRUE) == 0, NA, round(sum(coalesce(XWOBA, WOBA), na.rm = TRUE) / sum(WOBA_DENOMINATOR, na.rm = TRUE), 3)),
+            LATEST_GAME = max(GAME_DATE),
+            PA = sum(IS_PLATE_APPEARANCE, na.rm = TRUE)) %>%
+  filter(Pitch_Bucket != '101+') %>% # drop `101+` column
+  filter(Total_Pitches >= 50) %>% # filter for buckets where pitch count >= 50
+  rename(XWOBA = XWOBA_Bucket)
+
+# # df containing total pitches thrown by each pitcher since start of previous season (reg. season only)
+pitcher_totals <- pitch_count_buckets %>%
+  group_by(TXRPlayerID, MLBPlayerID, HOME_COMPETITION_LEVEL_ABBREV) %>%
+  summarise(LATEST_GAME = max(LATEST_GAME),
+            Total_Pitches = sum(Total_Pitches))
+
+# # pivoted df to make each count bucket its own column and filter where PA (BF) >= 15
+pitch_count_pivot <- pitch_count_buckets %>% 
+  select(TXRPlayerID, Pitch_Bucket, XWOBA) %>%
+  pivot_wider(names_from = Pitch_Bucket, values_from = XWOBA)
+```
+
+
+```{r}
+# # merge total pitches df and pitch count bucket together on pitcher ID
+pitcher_perf_by_count <- merge(pitcher_totals, pitch_count_pivot, by = c("TXRPlayerID", "MLBPlayerID", "HOME_COMPETITION_LEVEL_ABBREV"))
+
+# # get descriptive stats from df
+max_xwoba = max(pitcher_perf_by_count[, 6:9], na.rm = TRUE)
+min_xwoba = min(pitcher_perf_by_count[, 6:9], na.rm = TRUE)
+mean_xwoba = round(mean(unlist(pitcher_perf_by_count[, 6:9]), na.rm = TRUE), 3)
+```
+
+
+```{r}
+# query today's opponents and save in a vector
+opponents_query <- "select distinct(HOME_TEAM_NAME) as Opponent
+from silver.statsapi.schedules
+where AWAY_TEAM_NAME IN ('Round Rock Express', 'Frisco RoughRiders', 'Hickory Crawdads', 'Down East Wood Ducks')
+and GAME_DATE >= current_date() + 2 and GAME_DATE <= current_date() + 7
+union
+select distinct(AWAY_TEAM_NAME) as Opponent
+from silver.statsapi.schedules
+where HOME_TEAM_NAME IN ('Round Rock Express', 'Frisco RoughRiders', 'Hickory Crawdads', 'Down East Wood Ducks')
+and GAME_DATE >= current_date() + 2 and GAME_DATE <= current_date() + 7"
+
+opponents_data <- SparkR::sql(opponents_query) %>%
+      SparkR::as.data.frame()
+opponents_vec <- opponents_data$Opponent
+```
+
+
+```{r}
+# use lapply to run main function for each team in 'opponents_vec'
+ps <- invisible(lapply(opponents_vec, function(x) create_table(x, pitcher_perf_by_count, min_xwoba, mean_xwoba, max_xwoba)))
+```
