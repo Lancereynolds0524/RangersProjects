@@ -1,0 +1,390 @@
+
+---
+title: "Pitcher_Evals_Table"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+# Load libraries
+```
+
+
+```{r}
+devtools::install_github("texas-rangers-baseball-club/rangeRs", auth_token = "TOKEN")
+```
+
+
+```{r}
+install.packages("RPostgreSQL")
+```
+
+
+```{r}
+library(rangeRs)
+library(dplyr)
+library(caret)
+library(tidyr)
+library(scales)
+library(stringr)
+library(DBI)
+library(RPostgreSQL)
+```
+
+
+```{r}
+# Data Preparation & Preprocessing
+```
+
+
+```{r}
+# Query pitcher KPIs
+pitchers_query <- "select a.YEAR
+, a.COMPETITION_LEVEL_ABBREV
+, a.ORGANIZATIONS_ABBREV
+, b.ORG_ABBREV_EXTRA
+, a.TXR_PLAYER_ID
+, a.PLAYER_NAME_DISPLAY_FL
+, a.MAX_GAME_DATE
+, a.THROWS
+, a.AGE
+, a.AGGREGATE_DESCRIPTION
+, a.PITCHES as PITCH_COUNT
+, a.CHASE_PCT
+, a.STRIKE_PCT
+, a.SO_PCT as K_RATE
+, a.BB_PCT as BB_RATE
+, a.FIRST_PITCH_STRIKE_PCT as FPS_RATE
+, a.GROUND_BALL_PCT as GB_PCT
+, a.XWOBA
+, round(a.STUFF_GRADE,0) as STUFF
+, round(a.LVA_GRADE,0) as LVA
+, round(a.RELEASE_HEIGHT,1) as REL_HEIGHT
+, round(a.RELEASE_SIDE,1) as REL_SIDE
+from snowflake.rpt.VIEW_AGG_PITCH_PLAYER_COMPETITION_LEVEL a
+left join (SELECT distinct YEAR, COMPETITION_LEVEL_ABBREV, ORGANIZATION_ABBREV as ORG_ABBREV_EXTRA, TXR_PLAYER_ID, MAX_GAME_DATE, AGGREGATE_DESCRIPTION
+            from snowflake.rpt.view_agg_pitch_player
+            where YEAR >= 2018
+            and YEAR != 2020
+            and GAME_TYPE_DESCRIPTION = 'Regular Season'
+            and AGGREGATE_GROUP_DESCRIPTION IN ('Pitch Types', 'Pitch Type Categories', 'All')
+            and COMPETITION_LEVEL_ABBREV IN ('A','A+','AA','AAA','MLB')
+            and TXR_PLAYER_ID is not null) b
+            on a.YEAR = b.YEAR and a.COMPETITION_LEVEL_ABBREV = b.COMPETITION_LEVEL_ABBREV and a.TXR_PLAYER_ID = b.TXR_PLAYER_ID and a.MAX_GAME_DATE = b.MAX_GAME_DATE and a.AGGREGATE_DESCRIPTION = b.AGGREGATE_DESCRIPTION
+where a.YEAR >= 2018
+and a.YEAR != 2020
+and a.GAME_TYPE_DESCRIPTION = 'Regular Season'
+and a.AGGREGATE_GROUP_DESCRIPTION IN ('Pitch Types', 'Pitch Type Categories', 'All')
+and a.COMPETITION_LEVEL_ABBREV IN ('A','A+','AA','AAA','MLB')
+and a.TXR_PLAYER_ID is not null
+order by a.PLAYER_NAME_DISPLAY_FL, a.AGGREGATE_DESCRIPTION"
+
+pitchers_data <- SparkR::sql(pitchers_query) %>%
+    SparkR::as.data.frame()
+
+# Mung and preprocess df
+pitchers_data <- pitchers_data %>%
+  group_by(TXR_PLAYER_ID, YEAR) %>%
+  mutate(ORGANIZATIONS_ABBREV = ifelse(is.na(ORGANIZATIONS_ABBREV), unique(ORGANIZATIONS_ABBREV)[!is.na(unique(ORGANIZATIONS_ABBREV))][1], ORGANIZATIONS_ABBREV)) %>%
+  ungroup() %>%
+  mutate(ORGANIZATIONS_ABBREV = coalesce(ORGANIZATIONS_ABBREV, ORG_ABBREV_EXTRA)) %>%
+  select(-ORG_ABBREV_EXTRA) %>%
+  distinct(YEAR, COMPETITION_LEVEL_ABBREV, ORGANIZATIONS_ABBREV, TXR_PLAYER_ID, MAX_GAME_DATE, AGGREGATE_DESCRIPTION, .keep_all = TRUE) %>%
+  mutate(ORGANIZATIONS_ABBREV = gsub("LA", "LAD", ORGANIZATIONS_ABBREV)) %>%
+  mutate(ORGANIZATIONS_ABBREV = gsub("ANA", "LAA", ORGANIZATIONS_ABBREV)) %>%
+  mutate(ORGANIZATIONS_ABBREV = gsub("ARI", "AZ", ORGANIZATIONS_ABBREV)) %>%
+  mutate(ORGANIZATIONS_ABBREV = gsub("WAS", "WSH", ORGANIZATIONS_ABBREV)) %>%
+  mutate(AGGREGATE_DESCRIPTION = str_replace_all(AGGREGATE_DESCRIPTION, "vs All - FB", "FB"),
+         AGGREGATE_DESCRIPTION = str_replace_all(AGGREGATE_DESCRIPTION, "vs All - BB", "BB"),
+         AGGREGATE_DESCRIPTION = str_replace_all(AGGREGATE_DESCRIPTION, "vs All - OS", "OS"),
+         AGGREGATE_DESCRIPTION = str_replace_all(AGGREGATE_DESCRIPTION, " vs All", "")) %>%
+  group_by(TXR_PLAYER_ID, YEAR, COMPETITION_LEVEL_ABBREV) %>% # Add dummy variable for each pitch type
+  mutate(HAS_FASTBALL = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Fastball']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0),
+         HAS_SINKER = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Sinker']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0),
+         HAS_SLIDER = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Slider']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0),
+         HAS_CURVE = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Curveball']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0),
+         HAS_CHANGE = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Changeup']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0),
+         HAS_SPLITTER = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Splitter']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0),
+         HAS_CUTTER = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Cutter']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0),
+         HAS_KNUCK = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Knuckleball']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0),
+         HAS_SCREW = ifelse(sum(PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'Screwball']) / PITCH_COUNT[TXR_PLAYER_ID == TXR_PLAYER_ID & YEAR == YEAR & COMPETITION_LEVEL_ABBREV == COMPETITION_LEVEL_ABBREV & AGGREGATE_DESCRIPTION == 'All'] > 0.05, 1, 0)) %>%
+  ungroup()
+
+# Pivot table wider to make each pitch grade it's own column
+stuff <- pitchers_data %>%
+  select(YEAR, COMPETITION_LEVEL_ABBREV, TXR_PLAYER_ID, AGGREGATE_DESCRIPTION, STUFF) %>%
+  filter(AGGREGATE_DESCRIPTION %in% c('FB','BB','OS')) %>%
+  pivot_wider(names_from = AGGREGATE_DESCRIPTION, values_from = STUFF) %>%
+  rename('FB_STUFF' = 'FB',
+         'BB_STUFF' = 'BB',
+         'OS_STUFF' = 'OS')
+
+lva <- pitchers_data %>%
+  select(YEAR, COMPETITION_LEVEL_ABBREV, TXR_PLAYER_ID, AGGREGATE_DESCRIPTION, LVA) %>%
+  filter(AGGREGATE_DESCRIPTION %in% c('FB','BB','OS')) %>%
+  pivot_wider(names_from = AGGREGATE_DESCRIPTION, values_from = LVA) %>%
+  rename('FB_LVA' = 'FB',
+         'BB_LVA' = 'BB',
+         'OS_LVA' = 'OS')
+
+pitchers_evals <- pitchers_data %>%
+  filter(AGGREGATE_DESCRIPTION == 'All') %>%
+  drop_na() %>%
+  select(-c(STUFF, LVA))
+
+pitchers_evals <- merge(pitchers_evals, stuff, by = c("TXR_PLAYER_ID", "YEAR", "COMPETITION_LEVEL_ABBREV"))
+pitchers_evals <- merge(pitchers_evals, lva, by = c("TXR_PLAYER_ID", "YEAR", "COMPETITION_LEVEL_ABBREV"))
+pitchers_evals <- pitchers_evals %>% filter(PITCH_COUNT >= 400 | COMPETITION_LEVEL_ABBREV == 'MLB')
+```
+
+
+```{r}
+pitchers_ids <- unique(as.character(pitchers_evals$TXR_PLAYER_ID))
+pitchers_string <- toString(sprintf("'%s'", pitchers_ids))
+
+# Set a basis for extension across all tech and scale extension values
+extension_query <- "select PITCHER_TXR_PLAYER_ID
+, YEAR
+, HOME_COMPETITION_LEVEL_ABBREV
+, mean(EXTENSION) as EXTENSION
+, count(*) as NUM_PITCHES
+, case when HAS_HAWKEYE = 'true' or HAS_HAWKEYE_MINORS = 'true' then 'HK'
+       when HAS_TRACKMAN = 'true' then 'TM'
+       else 'SC' end as TECH
+from platinum.rpt.whpm_sf
+where HOME_COMPETITION_LEVEL_ABBREV in ('A','A+','AA','AAA','MLB')
+and GAME_TYPE_CODE = 'R'
+and YEAR >= 2018
+and YEAR != 2020
+and EXTENSION is not null
+and PITCH_TYPE_CATEGORY = 'Fastball'
+and PITCHER_TXR_PLAYER_ID in (%s)
+group by PITCHER_TXR_PLAYER_ID, YEAR, HOME_COMPETITION_LEVEL_ABBREV, TECH"
+
+extension_query <- sprintf(extension_query, pitchers_string)
+extension_data <- SparkR::sql(extension_query) %>%
+    SparkR::as.data.frame() %>%
+    mutate(NUM_PITCHES = as.numeric(NUM_PITCHES))
+
+EXTENSION_OVR <- stats::weighted.mean(extension_data$EXTENSION, extension_data$NUM_PITCHES)
+
+extension_data <- extension_data %>%
+  mutate(NUM_PITCHES = as.numeric(NUM_PITCHES)) %>%
+  group_by(YEAR, HOME_COMPETITION_LEVEL_ABBREV, TECH) %>%
+  mutate(EXT_CONST = EXTENSION_OVR / weighted.mean(EXTENSION, NUM_PITCHES)) %>%
+  ungroup() %>%
+  mutate(EXTENSION = EXTENSION * EXT_CONST) %>%
+  select(-EXT_CONST) %>%
+  group_by(PITCHER_TXR_PLAYER_ID, YEAR, HOME_COMPETITION_LEVEL_ABBREV) %>%
+  summarise(EXTENSION = round(weighted.mean(EXTENSION, NUM_PITCHES), 1))
+```
+
+
+```{r}
+pitchers_evals <- merge(pitchers_evals, extension_data, by.x = c("TXR_PLAYER_ID", "YEAR", "COMPETITION_LEVEL_ABBREV"), by.y = c("PITCHER_TXR_PLAYER_ID", "YEAR", "HOME_COMPETITION_LEVEL_ABBREV"), all.x = TRUE) %>%
+  relocate(EXTENSION, .after = REL_SIDE)
+
+# Find z-scores for each KPI
+pitchers_evals_z <- pitchers_evals %>%
+  group_by(YEAR, COMPETITION_LEVEL_ABBREV, THROWS) %>%
+  summarise(TXR_PLAYER_ID,
+            YEAR,
+            COMPETITION_LEVEL_ABBREV,
+            ORGANIZATIONS_ABBREV,
+            PLAYER_NAME_DISPLAY_FL,
+            THROWS,
+            AGE,
+            MAX_GAME_DATE,
+            PITCH_COUNT,
+            HAS_FASTBALL,
+            HAS_SINKER,
+            HAS_SLIDER,
+            HAS_CURVE,
+            HAS_CHANGE,
+            HAS_SPLITTER,
+            HAS_CUTTER,
+            HAS_KNUCK,
+            HAS_SCREW,
+            REL_HEIGHT_TRUE = REL_HEIGHT,
+            REL_SIDE_TRUE = REL_SIDE,
+            EXTENSION_TRUE = EXTENSION,
+           REL_HEIGHT_Z = (REL_HEIGHT - mean(REL_HEIGHT, na.rm = TRUE)) / sd(REL_HEIGHT, na.rm = TRUE),
+           REL_SIDE_Z = (REL_SIDE - mean(REL_SIDE, na.rm = TRUE)) / sd(REL_SIDE, na.rm = TRUE),,
+           EXTENSION_Z = (EXTENSION - mean(EXTENSION, na.rm = TRUE)) / sd(EXTENSION, na.rm = TRUE),
+           CHASE_PCT_Z = (CHASE_PCT - mean(CHASE_PCT, na.rm = TRUE)) / sd(CHASE_PCT, na.rm = TRUE),
+           K_RATE_Z = (K_RATE - mean(K_RATE, na.rm = TRUE)) / sd(K_RATE, na.rm = TRUE),
+           BB_RATE_Z = (BB_RATE - mean(BB_RATE, na.rm = TRUE)) / sd(BB_RATE, na.rm = TRUE),
+           FPS_RATE_Z = (FPS_RATE - mean(FPS_RATE, na.rm = TRUE)) / sd(FPS_RATE, na.rm = TRUE),
+           GB_PCT_Z = (GB_PCT - mean(GB_PCT, na.rm = TRUE)) / sd(GB_PCT, na.rm = TRUE),
+           XWOBA_Z = (XWOBA - mean(XWOBA, na.rm = TRUE)) / sd(XWOBA, na.rm = TRUE),
+           FB_STUFF_Z = (FB_STUFF - mean(FB_STUFF, na.rm = TRUE)) / sd(FB_STUFF, na.rm = TRUE),
+           BB_STUFF_Z = (BB_STUFF - mean(BB_STUFF, na.rm = TRUE)) / sd(BB_STUFF, na.rm = TRUE),
+           OS_STUFF_Z = (OS_STUFF - mean(OS_STUFF, na.rm = TRUE)) / sd(OS_STUFF, na.rm = TRUE),
+           FB_LVA_Z = (FB_LVA - mean(FB_LVA, na.rm = TRUE)) / sd(FB_LVA, na.rm = TRUE),
+           BB_LVA_Z = (BB_LVA - mean(BB_LVA, na.rm = TRUE)) / sd(BB_LVA, na.rm = TRUE),
+           OS_LVA_Z = (OS_LVA - mean(OS_LVA, na.rm = TRUE)) / sd(OS_LVA, na.rm = TRUE),
+           .groups = 'drop'
+         )
+
+# Assign class for each KPI based on z-score
+pitchers_evals_rank <- pitchers_evals_z %>%
+  mutate(REL_SIDE_Z = ifelse(REL_SIDE_Z > 2, 3,
+                          ifelse(REL_SIDE_Z <= 2 & REL_SIDE_Z > 1, 2,
+                          ifelse(REL_SIDE_Z <= 1 & REL_SIDE_Z > 0.5, 1,
+                          ifelse(REL_SIDE_Z <= 0.5 & REL_SIDE_Z > -0.5, 0,
+                          ifelse(REL_SIDE_Z <= -0.5 & REL_SIDE_Z > -1, -1,
+                          ifelse(REL_SIDE_Z <= -1 & REL_SIDE_Z >= -2, -2,
+                          ifelse(REL_SIDE_Z < -2, -3, NA)))))))) %>%
+  mutate(across(c(REL_HEIGHT_Z, EXTENSION_Z), ~ ifelse(.x > 2, 7,
+                          ifelse(.x <= 2 & .x > 1, 6,
+                          ifelse(.x <= 1 & .x > 0.5, 5,
+                          ifelse(.x <= 0.5 & .x > -0.5, 4,
+                          ifelse(.x <= -0.5 & .x > -1, 3,
+                          ifelse(.x <= -1 & .x >= -2, 2,
+                          ifelse(.x < -2, 1, NA))))))))) %>%
+  mutate(across(c(CHASE_PCT_Z:K_RATE_Z, FPS_RATE_Z:GB_PCT_Z, FB_STUFF_Z:OS_LVA_Z), ~ ifelse(.x > 2, "Elite",
+                          ifelse(.x <= 2 & .x > 1, "Great",
+                          ifelse(.x <= 1 & .x > 0.5, "Above Average",
+                          ifelse(.x <= 0.5 & .x > -0.5, "Average",
+                          ifelse(.x <= -0.5 & .x > -1, "Below Average",
+                          ifelse(.x <= -1 & .x >= -2, "Poor",
+                          ifelse(.x < -2, "Awful", NA))))))))) %>%
+  mutate(across(c(BB_RATE_Z, XWOBA_Z), ~ ifelse(.x > 2, "Awful",
+                          ifelse(.x <= 2 & .x > 1, "Poor",
+                          ifelse(.x <= 1 & .x > 0.5, "Below Average",
+                          ifelse(.x <= 0.5 & .x > -0.5, "Average",
+                          ifelse(.x <= -0.5 & .x > -1, "Above Average",
+                          ifelse(.x <= -1 & .x >= -2, "Great",
+                          ifelse(.x < -2, "Elite", NA))))))))) %>%
+  mutate(across(CHASE_PCT_Z:OS_LVA_Z, ~ factor(.x, c("Awful", "Poor","Below Average","Average","Above Average","Great","Elite"))),
+         across(HAS_FASTBALL:HAS_SCREW, ~ as.factor(.x)))
+
+colnames(pitchers_evals_rank) <- gsub('_Z','', colnames(pitchers_evals_rank))
+
+```
+
+
+```{r}
+# Finf MLB service time
+big_league_query <- "select txr_player_id, 
+major_service_years, 
+major_service_days
+from platinum.rpt.player_lookup pl 
+where minor_service_years is not null
+and is_pitcher = TRUE"
+
+big_league_data <- SparkR::sql(big_league_query) %>%
+    SparkR::as.data.frame()
+
+made_mlb_query <- "select TXR_PLAYER_ID, G, TBF
+from platinum.stats.stats_pitching_player_career
+where COMPETITION_LEVEL = 'MLB'
+and GAME_TYPE = 'R'
+and TXR_PLAYER_ID is not NULL
+and G > 0"
+
+made_mlb_data <- SparkR::sql(made_mlb_query) %>%
+    SparkR::as.data.frame() %>%
+    mutate(G = as.numeric(G),
+         TBF = as.numeric(TBF))
+
+# Add dummy variables for making MLB and having significant playing time at big leagues (seasoned_mlb)
+big_league_data <- merge(big_league_data, made_mlb_data, by.x = 'txr_player_id', by.y = 'TXR_PLAYER_ID', all.x = TRUE) %>%
+  mutate(G = ifelse(is.na(G), 0, G),
+         TBF = ifelse(is.na(TBF), 0, TBF)) %>%
+  mutate(made_mlb = ifelse((major_service_years > 0 | major_service_days > 0) & G > 0, 1, 0),
+         seasoned_mlb = ifelse(TBF >= 100, 1, 0)) %>%
+  select(-G)
+
+pitchers_evals_w_mlb <- merge(pitchers_evals_rank, big_league_data, by.x = 'TXR_PLAYER_ID', by.y = 'txr_player_id') %>%
+  arrange(PLAYER_NAME_DISPLAY_FL, YEAR, COMPETITION_LEVEL_ABBREV)
+
+# Find Start% for each pitcher
+roles_query <- "select TXR_PLAYER_ID, GAME_YEAR, COMPETITION_LEVEL, sum(G) as G, sum(GS) as GS
+from platinum.stats.stats_pitching_player_year
+where COMPETITION_LEVEL in ('A','A+','AA','AAA','MLB')
+and GAME_YEAR >= 2018
+and GAME_YEAR != 2020
+and GAME_TYPE = 'R'
+and TXR_PLAYER_ID is not NULL
+and G > 0
+group by TXR_PLAYER_ID, GAME_YEAR, COMPETITION_LEVEL
+order by TXR_PLAYER_ID, GAME_YEAR, COMPETITION_LEVEL"
+
+roles <- SparkR::sql(roles_query) %>%
+    SparkR::as.data.frame() %>%
+      mutate(G = as.numeric(G),
+            GS = as.numeric(GS)) %>%
+    mutate(START_PCT = round((GS / G), 2))
+
+pitchers_evals_w_mlb <- merge(pitchers_evals_w_mlb, roles, by.x = c("TXR_PLAYER_ID", "YEAR", "COMPETITION_LEVEL_ABBREV"), by.y = c("TXR_PLAYER_ID", "GAME_YEAR", "COMPETITION_LEVEL"), all.x = TRUE)
+
+# Aggregate MLB career stats for each pitcher
+stats_query <- "select MLB_PLAYER_ID
+, TXR_PLAYER_ID
+, G as G_MLB
+, GS as GS_MLB
+, IP as IP_MLB
+, TBF as TBF_MLB
+, PITCH as PITCH_MLB
+, FIP as FIP_MLB
+, round(SO_RATE * 100, 1) as SO_RATE_MLB
+, round(BB_RATE * 100, 1) as WALK_RATE_MLB
+, round(GB_RATE * 100, 1) as GB_RATE_MLB
+, WAR as WAR_MLB
+from platinum.stats.stats_pitching_player_career
+where COMPETITION_LEVEL = 'MLB'
+and GAME_TYPE = 'R'"
+
+stats_data <- SparkR::sql(stats_query) %>%
+    SparkR::as.data.frame() %>%
+    mutate(across(c(G_MLB, GS_MLB, TBF_MLB, PITCH_MLB), ~ as.numeric(.x)))
+
+# Merge everything together
+pitchers_evals_w_mlb <- merge(pitchers_evals_w_mlb, stats_data, by = "TXR_PLAYER_ID", all.x = TRUE) %>%
+group_by(TXR_PLAYER_ID) %>%
+  arrange(TXR_PLAYER_ID, MAX_GAME_DATE) %>%
+  ungroup()
+```
+
+
+```{r}
+# Write to Databricks & AWS
+```
+
+
+```{r}
+SparkR::saveAsTable(
+  df = SparkR::as.DataFrame(pitchers_evals_w_mlb),
+  tableName = "sandbox.analytics.pitcher_evals_year_comp_level",
+  mode = 'overwrite',
+  overwriteSchema = 'true'
+)
+```
+
+
+```{r}
+SparkR::saveAsTable(
+  df = SparkR::as.DataFrame(pitchers_evals_w_mlb),
+  tableName = 'gold.shiny_server.pitch_grade_app_player_role_comp_tool',
+  mode = 'overwrite'
+)
+```
+
+
+```{r}
+AWS_PG_USER <- dbutils.secrets.get(scope="SCOPE", key="USER")
+AWS_PG_PASS <- dbutils.secrets.get(scope="SCOPE", key="PASS")
+
+
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, dbname = "name",
+                 host = "host", port = 5432,
+                 user = AWS_PG_USER, password = AWS_PG_PASS)
+
+dbWriteTable(con, c("player_dev", "r_shiny_pitch_grade_app_player_role_comp_tool"), pitchers_evals_w_mlb, overwrite = TRUE, row.names = FALSE)
+
+dbDisconnect(con)
+```
