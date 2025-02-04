@@ -1,0 +1,934 @@
+
+---
+title: "MiLB_Sprint_Speed_Model"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+devtools::install_github("texas-rangers-baseball-club/rangeRs", auth_token = "TOKEN")
+```
+
+
+```{r}
+install.packages("xgboost")
+```
+
+
+```{r}
+install.packages("mlflow")
+```
+
+
+```{r}
+install.packages(c("VGAM","carrier"))
+```
+
+
+```{r}
+library(dplyr)
+library(caret)
+library(rangeRs)
+library(xgboost)
+library(mgcv)
+library(ggplot2)
+library(VGAM)
+library(mlflow)
+library(carrier)
+library(lubridate)
+```
+
+
+```{r}
+# Stolen Base Opportunities Taken (SBOT)
+```
+
+
+```{r}
+sb_opp_1b_query <- "select 
+whpm.BATTER_TEAM_NAME
+, whpm.BATTER_NAME_LAST_FIRST
+, whpm.PITCHER_TEAM_NAME
+, whpm.GAME_DATE
+, whpm.YEAR
+, whpm.INNING
+, whpm.BATTER_PER_GAME
+, whpm.PITCH_NUMBER
+, whpm.STRIKES_PRE_EVENT
+, whpm.BALLS_PRE_EVENT
+, whpm.PITCH_RESULT
+, whpm.RUNNER_1B_TXR_PLAYER_ID
+, whpm.RUNNER_1B_NAME_LAST_FIRST
+, whpm.RUNNER_2B_TXR_PLAYER_ID
+, whpm.RUNNER_2B_NAME_LAST_FIRST
+, whpm.RUNNER_3B_TXR_PLAYER_ID
+, whpm.RUNNER_3B_NAME_LAST_FIRST
+, whpm.RUNNER_1B_STOLEN_BASE as SB
+, whpm.RUNNER_1B_CAUGHT_STEALING as CS
+from platinum.rpt.whpm_sf whpm
+where whpm.YEAR in (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+and whpm.HOME_COMPETITION_LEVEL_ABBREV = 'MLB'
+and whpm.GAME_TYPE_CODE = 'R'
+and whpm.RUNNER_2B_TXR_PLAYER_ID IS NULL
+and whpm.RUNNER_1B_STOLEN_BASE IS NOT NULL
+and not (whpm.PITCH_NUMBER = 1 and whpm.PITCH_RESULT IN ('Hit Into Play','Hit Batter'))
+and not (whpm.PITCH_NUMBER = 0 and whpm.PITCH_RESULT = 'Not Applicable')
+order by whpm.RUNNER_1B_NAME_LAST_FIRST, whpm.GAME_DATE, whpm.BATTER_PER_GAME, whpm.PITCH_NUMBER"
+
+sb_opp_1b_data <- SparkR::sql(sb_opp_1b_query) %>%
+    SparkR::as.data.frame()
+
+sb_opp_2b_query <- "select 
+whpm.BATTER_TEAM_NAME
+, whpm.BATTER_NAME_LAST_FIRST
+, whpm.PITCHER_TEAM_NAME
+, whpm.GAME_DATE
+, whpm.YEAR
+, whpm.INNING
+, whpm.BATTER_PER_GAME
+, whpm.PITCH_NUMBER
+, whpm.STRIKES_PRE_EVENT
+, whpm.BALLS_PRE_EVENT
+, whpm.PITCH_RESULT
+, whpm.RUNNER_1B_TXR_PLAYER_ID
+, whpm.RUNNER_1B_NAME_LAST_FIRST
+, whpm.RUNNER_2B_TXR_PLAYER_ID
+, whpm.RUNNER_2B_NAME_LAST_FIRST
+, whpm.RUNNER_3B_TXR_PLAYER_ID
+, whpm.RUNNER_3B_NAME_LAST_FIRST
+, whpm.RUNNER_2B_STOLEN_BASE as SB
+, whpm.RUNNER_2B_CAUGHT_STEALING as CS
+from platinum.rpt.whpm_sf whpm
+where whpm.YEAR in (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+and whpm.HOME_COMPETITION_LEVEL_ABBREV = 'MLB'
+and whpm.GAME_TYPE_CODE = 'R'
+and whpm.RUNNER_3B_TXR_PLAYER_ID IS NULL
+and whpm.RUNNER_2B_STOLEN_BASE IS NOT NULL
+and not (whpm.PITCH_NUMBER = 1 and whpm.PITCH_RESULT IN ('Hit Into Play','Hit Batter'))
+and not (whpm.PITCH_NUMBER = 0 and whpm.PITCH_RESULT = 'Not Applicable')
+order by whpm.RUNNER_2B_NAME_LAST_FIRST, whpm.GAME_DATE, whpm.BATTER_PER_GAME, whpm.PITCH_NUMBER"
+
+sb_opp_2b_data <- SparkR::sql(sb_opp_2b_query) %>%
+    SparkR::as.data.frame()
+
+sb_opp_1b_totals <- sb_opp_1b_data %>%
+  group_by(RUNNER_1B_TXR_PLAYER_ID, YEAR) %>%
+  summarise(RUNNER_1B = first(clean_player_names(RUNNER_1B_NAME_LAST_FIRST)),
+            att_1b = sum(SB) + sum(CS),
+            opp_1b = n())
+
+sb_opp_2b_totals <- sb_opp_2b_data %>%
+  group_by(RUNNER_2B_TXR_PLAYER_ID, YEAR) %>%
+  summarise(RUNNER_2B = first(clean_player_names(RUNNER_2B_NAME_LAST_FIRST)),
+            att_2b = sum(SB) + sum(CS),
+            opp_2b = n())
+
+sb_opp <- merge(sb_opp_1b_totals, sb_opp_2b_totals, by.x = c('RUNNER_1B_TXR_PLAYER_ID', 'YEAR'), by.y = c('RUNNER_2B_TXR_PLAYER_ID','YEAR'), all = TRUE) %>%
+  rename(RUNNER_TXR_PLAYER_ID = RUNNER_1B_TXR_PLAYER_ID) %>%
+  group_by(RUNNER_TXR_PLAYER_ID, YEAR) %>%
+  mutate(att = sum(att_1b, att_2b, na.rm = TRUE),
+         opp = sum(opp_1b, opp_2b, na.rm = TRUE),
+         RUNNER_TXR_PLAYER_ID = as.numeric(RUNNER_TXR_PLAYER_ID)) %>%
+  summarise(RUNNER_TXR_PLAYER_ID,
+            YEAR,
+            RUNNER_1B,
+            att,
+            opp,
+            SBOT = (att / opp))
+```
+
+
+```{r}
+# Check first for a beta prior
+```
+
+
+```{r}
+sb_opp_filtered <- sb_opp %>%
+  filter(opp >= 10) %>%
+  filter(SBOT > 0) %>%
+  filter(SBOT < 1)
+
+m <- MASS::fitdistr(sb_opp_filtered$SBOT, dbeta,
+                    start = list(shape1 = 1, shape2 = 10))
+
+alpha0 <- m$estimate[1]
+beta0 <- m$estimate[2]
+
+hist(sb_opp_filtered$SBOT, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Distribution")
+
+curve(dbeta(x, alpha0, beta0), add=TRUE, col="red", lwd=2)
+
+list(alpha0, beta0)
+```
+
+
+```{r}
+# Check next for a beta binomial prior
+```
+
+
+```{r}
+# negative log likelihood of data given alpha; beta
+ll <- function(alpha, beta) {
+  -sum(dbetabinom.ab(sb_opp$att, sb_opp$opp, alpha, beta, log = TRUE))
+}
+
+m <- mle(ll, start = list(alpha = 1, beta = 10), method = "L-BFGS-B")
+coef(m)
+```
+
+
+```{r}
+# Plot histogram of the data
+hist(sb_opp$SBOT, breaks=20, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Binomial Distribution",
+     xlab="Values", ylab="Density")
+
+# Parameters for the beta distribution
+alpha <- m@coef[["alpha"]]
+beta <- m@coef[["beta"]]
+
+# Add a beta distribution curve
+curve(dbeta(x, alpha, beta), add=TRUE, col="red", lwd=2)
+```
+
+
+```{r}
+sb_opp_w_priors <- sb_opp %>%
+  mutate(att = ifelse(opp < 10, att + alpha, att),
+         opp = ifelse(opp < 10, opp + alpha + beta, opp),
+         SBOT = att / opp)
+```
+
+
+```{r}
+# Plot histogram of the data
+hist(sb_opp_w_priors$SBOT, breaks=20, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Binomial Distribution",
+     xlab="Values", ylab="Density")
+
+# Parameters for the beta distribution (you might need to estimate these)
+alpha <- m@coef[["alpha"]]
+beta <- m@coef[["beta"]]
+
+# Add a beta distribution curve
+curve(dbeta(x, alpha, beta), add=TRUE, col="red", lwd=2)
+```
+
+
+```{r}
+# Triples Rate
+```
+
+
+```{r}
+triples_rate_query <- "select TXR_PLAYER_ID, PLAYER_NAME_FL, GAME_YEAR, sum(B3) as B3, sum(AB) as AB, sum(B3) / sum(AB) as Triples_Rate
+from snowflake.rpt.view_mlb_curbat_player
+where GAME_YEAR IN (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+and COMPETITION_LEVEL_ABBREV = 'MLB'
+and GAME_TYPE = 'R'
+and AB > 0
+group by TXR_PLAYER_ID, PLAYER_NAME_FL, GAME_YEAR
+order by PLAYER_NAME_FL, GAME_YEAR"
+
+triples_rate <- SparkR::sql(triples_rate_query) %>%
+    SparkR::as.data.frame()
+```
+
+
+```{r}
+# Check first for a beta prior
+```
+
+
+```{r}
+triples_rate_filtered <- triples_rate %>%
+  filter(AB >= 150) %>%
+  filter(Triples_Rate > 0) %>%
+  filter(Triples_Rate < 1)
+
+m <- MASS::fitdistr(triples_rate_filtered$Triples_Rate, dbeta,
+                    start = list(shape1 = 1, shape2 = 10))
+
+alpha0 <- m$estimate[1]
+beta0 <- m$estimate[2]
+
+hist(triples_rate_filtered$Triples_Rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Distribution")
+
+curve(dbeta(x, alpha0, beta0), add=TRUE, col="red", lwd=2)
+
+list(alpha0, beta0)
+```
+
+
+```{r}
+# Check next for a beta binomial prior
+```
+
+
+```{r}
+# negative log likelihood of data given alpha; beta
+ll <- function(alpha, beta) {
+  -sum(dbetabinom.ab(triples_rate$B3, triples_rate$AB, alpha, beta, log = TRUE))
+}
+
+m <- mle(ll, start = list(alpha = 1, beta = 10), method = "BFGS")
+coef(m)
+```
+
+
+```{r}
+# Plot histogram of the data
+hist(triples_rate$Triples_Rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Binomial Distribution",
+     xlab="Values", ylab="Density")
+
+# Parameters for the beta distribution (you might need to estimate these)
+alpha <- m@coef[["alpha"]]
+beta <- m@coef[["beta"]]
+
+# Add a beta distribution curve
+curve(dbeta(x, alpha, beta), add=TRUE, col="red", lwd=2)
+```
+
+
+```{r}
+triples_rate_w_priors <- triples_rate %>%
+  mutate(B3 = ifelse(AB < 150, B3 + alpha, B3),
+         AB = ifelse(AB < 150, AB + alpha + beta, AB),
+         Triples_Rate = B3 / AB)
+```
+
+
+```{r}
+# Plot histogram of the data
+hist(triples_rate_w_priors$Triples_Rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Binomial Distribution",
+     xlab="Values", ylab="Density")
+
+# Parameters for the beta distribution (you might need to estimate these)
+alpha <- m@coef[["alpha"]]
+beta <- m@coef[["beta"]]
+
+# Add a beta distribution curve
+curve(dbeta(x, alpha, beta), add=TRUE, col="red", lwd=2)
+```
+
+
+```{r}
+# 1st to 3rd Rate
+```
+
+
+```{r}
+first_third_query <- "select MLB_PLAY_GUID
+, GAME_DATE
+, GAME_YEAR
+, GAME_PITCH_NUMBER
+, PLAY_DESCRIPTION
+, case when inning_half = 'bottom' then home_team_name else away_team_name end as BATTING_NAME_ABBREV
+, case when inning_half = 'bottom' then away_team_name else home_team_name end as FIELDING_NAME_ABBREV
+, MLB_RUNNER_1B_ID
+, MLB_RUNNER_3B_POST_EVENT_ID, sub.*
+from silver.mlb.pitch_detail
+inner join (select BATTER_NAME_LAST_FIRST AS RUNNER_NAME_LAST_FIRST, BATTER_TXR_PLAYER_ID AS RUNNER_TXR_ID, BATTER_MLB_PLAYER_ID AS RUNNER_MLB_ID
+            from platinum.rpt.whpm_sf
+            where BATTER_TXR_PLAYER_ID IS NOT NULL
+            and BATTER_MLB_PLAYER_ID IS NOT NULL
+            and YEAR IN (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+            and GAME_TYPE_CODE = 'R'
+            and HOME_COMPETITION_LEVEL_ABBREV = 'MLB'
+            group by RUNNER_NAME_LAST_FIRST, RUNNER_TXR_ID, RUNNER_MLB_ID) sub
+            on MLB_RUNNER_1B_ID = RUNNER_MLB_ID
+where GAME_YEAR IN (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+and GAME_TYPE = 'R'
+and mlb_home_team_league_id in (103,104)
+and MLB_RUNNER_1B_ID IS NOT NULL
+and (MLB_RUNNER_3B_POST_EVENT_ID = MLB_RUNNER_1B_ID or MLB_RUNNER_3B_POST_EVENT_ID IS NULL)
+and PLAY_RESULT = 'single'
+and FIRST_FIELDER_POSITION in ('LF','CF','RF')
+and not contains(PLAY_DESCRIPTION, 'advances to 3rd')
+order by sub.RUNNER_NAME_LAST_FIRST, GAME_DATE, GAME_PITCH_NUMBER"
+
+first_third_data <- SparkR::sql(first_third_query) %>%
+    SparkR::as.data.frame()
+
+first_third <- first_third_data %>%
+  group_by(RUNNER_TXR_ID, RUNNER_NAME_LAST_FIRST, GAME_YEAR) %>%
+  summarise(f_t_opp = n(),
+            f_t_taken = sum(MLB_RUNNER_3B_POST_EVENT_ID == MLB_RUNNER_1B_ID, na.rm = TRUE)) %>%
+  ungroup(RUNNER_TXR_ID, RUNNER_NAME_LAST_FIRST, GAME_YEAR) %>%
+  mutate(RUNNER_NAME = clean_player_names(RUNNER_NAME_LAST_FIRST),
+         RUNNER_TXR_ID = as.numeric(RUNNER_TXR_ID),
+         GAME_YEAR = as.numeric(GAME_YEAR)) %>%
+  summarise(RUNNER_TXR_ID,
+            RUNNER_NAME,
+            GAME_YEAR,
+            f_t_taken,
+            f_t_opp,
+            f_t_rate = (f_t_taken / f_t_opp))
+```
+
+
+```{r}
+# Check first for a beta prior
+```
+
+
+```{r}
+first_third_filtered <- first_third %>%
+  filter(f_t_opp >= 5) %>%
+  filter(f_t_rate > 0) %>%
+  filter(f_t_rate < 1)
+
+m <- MASS::fitdistr(first_third_filtered$f_t_rate, dbeta,
+                    start = list(shape1 = 1, shape2 = 10))
+
+alpha0 <- m$estimate[1]
+beta0 <- m$estimate[2]
+
+hist(first_third_filtered$f_t_rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Distribution",
+     xlab="Values", ylab="Density",
+     ylim = c(0,4))
+
+curve(dbeta(x, alpha0, beta0), add=TRUE, col="red", lwd=2)
+
+list(alpha0, beta0)
+```
+
+
+```{r}
+# Now check with beta binomial prior
+```
+
+
+```{r}
+# negative log likelihood of data given alpha; beta
+ll <- function(alpha, beta) {
+  -sum(dbetabinom.ab(first_third$f_t_taken, first_third$f_t_opp, alpha, beta, log = TRUE))
+}
+
+m <- mle(ll, start = list(alpha = 1, beta = 10), method = "BFGS")
+coef(m)
+```
+
+
+```{r}
+# Plot histogram of the data
+hist(first_third$f_t_rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Binomial Distribution",
+     xlab="Values", ylab="Density",
+     ylim = c(0,5))
+
+# Parameters for the beta distribution (you might need to estimate these)
+alpha <- m@coef[["alpha"]]
+beta <- m@coef[["beta"]]
+
+# Add a beta distribution curve
+curve(dbeta(x, alpha, beta), add=TRUE, col="red", lwd=2)
+```
+
+
+```{r}
+f_t_rate_w_priors <- first_third %>%
+  mutate(f_t_taken = ifelse(f_t_opp < 5, f_t_taken + alpha, f_t_taken),
+         f_t_opp = ifelse(f_t_opp < 5, f_t_opp + alpha + beta, f_t_opp),
+         f_t_rate = f_t_taken / f_t_opp)
+```
+
+
+```{r}
+# Plot histogram of the data
+hist(f_t_rate_w_priors$f_t_rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Binomial Distribution",
+     xlab="Values", ylab="Density",
+     ylim = c(0,5))
+
+# Parameters for the beta distribution (you might need to estimate these)
+alpha <- m@coef[["alpha"]]
+beta <- m@coef[["beta"]]
+
+# Add a beta distribution curve
+curve(dbeta(x, alpha, beta), add=TRUE, col="red", lwd=2)
+```
+
+
+```{r}
+# Beat Out Backside of Double Plays
+```
+
+
+```{r}
+throws_query <- "select pd.mlb_play_guid
+, pd.home_team_name
+, pd.mlb_home_team_league_id
+, pd.game_date
+, pd.game_year
+, pd.second_fielder_position
+, sub.*
+from silver.mlb.pitch_detail pd
+inner join (select MLB_PLAY_GUID
+            , BATTER_NAME_LAST_FIRST
+            , BATTER_TXR_PLAYER_ID
+            , BATTER_STANCE
+            , HOME_COMPETITION_LEVEL_ABBREV
+            , VENUE_FULL_NAME
+            , PLAY_RESULT_DESCRIPTION
+            , BASE_STATE
+            , OUTS_PRE_EVENT
+            , HIT_EXIT_SPEED
+            , HIT_LAUNCH_ANGLE
+            , HIT_DIRECTION
+            , 0 AS IS_DP
+            from platinum.rpt.whpm_sf
+            where contains(PLAY_RESULT_DESCRIPTION, 'force out')
+            and not contains(PLAY_RESULT_DESCRIPTION, 'advances to 2nd')
+            and YEAR in (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+            and IS_IN_PLAY = TRUE
+            and GAME_TYPE_CODE = 'R'
+            and HOME_COMPETITION_LEVEL_ABBREV in ('AAA','MLB')
+            and IS_GROUNDBALL = TRUE
+            and IS_RUNNER_ON_1B = TRUE
+            and OUTS_PRE_EVENT < 2) as sub
+on pd.mlb_play_guid = sub.MLB_PLAY_GUID
+where pd.game_year in (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+and pd.game_type = 'R'
+and pd.mlb_home_team_league_id in (103,104,109,110,111,112,113,116,117,118,122,123,126)
+and pd.first_fielder_position in ('1B','2B','SS','3B','P','C')
+and pd.second_fielder_position in ('2B','SS')
+and sub.HIT_EXIT_SPEED is not null
+union
+select pd.mlb_play_guid
+, pd.home_team_name
+, pd.mlb_home_team_league_id
+, pd.game_date
+, pd.game_year
+, pd.second_fielder_position
+, sub.*
+from silver.mlb.pitch_detail pd
+inner join (select MLB_PLAY_GUID
+            , BATTER_NAME_LAST_FIRST
+            , BATTER_TXR_PLAYER_ID
+            , BATTER_STANCE
+            , HOME_COMPETITION_LEVEL_ABBREV
+            , VENUE_FULL_NAME
+            , PLAY_RESULT_DESCRIPTION
+            , BASE_STATE
+            , OUTS_PRE_EVENT
+            , HIT_EXIT_SPEED
+            , HIT_LAUNCH_ANGLE
+            , HIT_DIRECTION
+            , 1 AS IS_DP
+            from platinum.rpt.whpm_sf
+            where contains(PLAY_RESULT_DESCRIPTION, 'grounds into a double play')
+            and contains(PLAY_RESULT_DESCRIPTION, 'out at 1st')
+            and YEAR in (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+            and IS_IN_PLAY = TRUE
+            and GAME_TYPE_CODE = 'R'
+            and HOME_COMPETITION_LEVEL_ABBREV in ('AAA','MLB')
+            and IS_GROUNDBALL = TRUE
+            and IS_RUNNER_ON_1B = TRUE
+            and OUTS_PRE_EVENT < 2) as sub
+on pd.mlb_play_guid = sub.MLB_PLAY_GUID
+where pd.game_year in (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+and pd.game_type = 'R'
+and pd.mlb_home_team_league_id in (103,104,109,110,111,112,113,116,117,118,122,123,126)
+and pd.first_fielder_position in ('1B','2B','SS','3B','P','C')
+and pd.second_fielder_position in ('2B','SS')
+and sub.HIT_EXIT_SPEED is not null
+order by pd.game_date, sub.HOME_COMPETITION_LEVEL_ABBREV"
+
+throws <- SparkR::sql(throws_query) %>%
+    SparkR::as.data.frame()
+```
+
+
+```{r}
+# Split into train and test set
+```
+
+
+```{r}
+data <- throws %>%
+  mutate(BATTER_STANCE = as.numeric(as.factor(BATTER_STANCE)),
+         BASE_STATE = as.numeric(as.factor(BASE_STATE)),
+         OUTS_PRE_EVENT = as.numeric(OUTS_PRE_EVENT))
+
+names(data) <- toupper(names(data))
+
+train <- data[data$HOME_COMPETITION_LEVEL_ABBREV == 'AAA',]
+test <- data[data$HOME_COMPETITION_LEVEL_ABBREV == 'MLB',]
+train_data = train %>%
+  select(HIT_EXIT_SPEED, HIT_LAUNCH_ANGLE, HIT_DIRECTION, BATTER_STANCE, BASE_STATE, IS_DP)
+train_x <- as.matrix(train_data %>% select(-IS_DP))
+train_y = as.factor(train_data$IS_DP)
+test_data = test %>%
+  select(HIT_EXIT_SPEED, HIT_LAUNCH_ANGLE, HIT_DIRECTION, BATTER_STANCE, BASE_STATE, IS_DP)
+test_x <- as.matrix(test_data %>% select(-IS_DP))
+test_y = as.factor(test_data$IS_DP)
+
+dtrain = xgb.DMatrix(data = as.matrix(train_data %>% select(-IS_DP)), label = train_data$IS_DP)
+dtest_x = xgb.DMatrix(data = as.matrix(test_data %>% select(-IS_DP)))
+```
+
+
+```{r}
+# Build predictive model using XGBoost
+```
+
+
+```{r}
+# Use grid search CV on training set
+train_control <- trainControl(method = "cv", number = 10, search = "grid")
+
+# Define xgboost parameters to be tested in grid search
+gbmGrid <-  expand.grid(max_depth = c(3,4,5), 
+                        nrounds = c(600, 800, 1000),    # number of trees
+                        eta = c(0.015, 0.01, 0.005),
+                        gamma = 0,
+                        subsample = 1,
+                        min_child_weight = 1,
+                        colsample_bytree = 0.6)
+
+model = train(x = as.matrix(train_data %>% select(-IS_DP)), 
+              y = train_data$IS_DP, 
+              method = "xgbTree", 
+              trControl = train_control,
+              tuneGrid = gbmGrid)
+
+# summarising the results
+print(model)
+
+# Create final model
+
+dp_model <- xgboost(data = dtrain, max_depth = model$bestTune$max_depth, eta = model$bestTune$eta,
+                       gamma = model$bestTune$gamma, colsample_bytree = model$bestTune$colsample_bytree,
+                       min_child_weight = model$bestTune$min_child_weight, nrounds = model$bestTune$nrounds,
+                       objective = "binary:logistic")
+
+
+#saveRDS(dp_model,file = "double_play_pred_aaa.RDS")
+
+#use model to make predictions on test data
+
+pred_y = predict(dp_model, dtest_x, type = "prob")
+pred_y_flag = as.factor(ifelse(pred_y > 0.5, 1, 0))
+accuracy <- mean(as.numeric(pred_y > 0.5) == test_data$IS_DP)
+print(paste("Accuracy:", accuracy))
+
+# performance metrics on the test data
+mat <- confusionMatrix(data = pred_y_flag, reference = test_y, positive = "1")
+mat
+
+test$DP_FLAG_PRED = pred_y_flag
+test$DP_PROB_PRED = pred_y
+```
+
+
+```{r}
+# Create experiment
+```
+
+
+```{r}
+with(mlflow::mlflow_start_run(experiment_id="EXPERIMENT_ID"), {
+predictor <- carrier::crate(function(x, ...) stats::predict(!!dp_model, newdata = x, ...))
+mlflow::mlflow_log_model(predictor, "DP_Prob_Model")
+})
+```
+
+
+```{r}
+# Find Feature Importances
+```
+
+
+```{r}
+importance_matrix = xgb.importance(colnames(dtrain), model = dp_model)
+importance_matrix
+
+xgb.plot.importance(importance_matrix, rel_to_first = TRUE, xlab = "Relative importance")
+```
+
+
+```{r}
+# Create a Calibration Plot
+```
+
+
+```{r}
+rsq <- function (x, y) cor(x, y) ^ 2
+
+set.seed(1)
+
+test <- test[!duplicated((names(test)))]
+
+cal_plot <- test %>%
+            mutate(pred = round(DP_PROB_PRED, 1)) %>%
+            group_by(pred) %>%
+            summarise(count = n(),
+                      actual = round(mean(as.numeric(IS_DP), na.rm = TRUE), 2)) %>%
+            mutate(count_dots = count / 300)
+
+#cal_plot <- cal_plot %>% filter(pred != 0.1)
+
+r_squared <- rsq(cal_plot$pred, cal_plot$actual)
+
+# cal_plot %>%
+#   gt() %>%
+#   cols_label(
+#     pred = md("**Prediction**"),
+#     count = md("**Count**"),
+#     actual = md("**Actual**")
+#   ) %>%
+#   cols_hide(count_dots) %>%
+#   cols_align(align = "center",
+#                  columns = c(pred, count, actual)) %>%
+#   tab_footnote(footnote = paste0("R\U00B2 = ", round(r_squared, 3)),
+#                locations = cells_column_labels(columns = actual))
+
+ggplot(data = cal_plot, aes(pred, actual)) +
+  geom_line(colour = "orange", size = 1.2) +
+  geom_point(colour = "orange", size = cal_plot$count_dots) +
+  geom_abline(intercept = 0, slope = 1, colour = "blue", linetype = "dashed") +
+  #geom_smooth(method = lm, aes(weight = count_dots), color = "blue") +
+  xlab("Mean Predicted Value") +
+  ylab("Fraction of Positives") +
+  ggtitle("Calibration Plot") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+
+```{r}
+r_squared
+```
+
+
+```{r}
+display(cal_plot)
+```
+
+
+```{r}
+non_dp <- test[!duplicated(names(test))]
+
+non_dp <- non_dp %>%
+  filter(DP_PROB_PRED >= 0.5) %>%
+  mutate(BATTER_NAME = clean_player_names(BATTER_NAME_LAST_FIRST)) %>%
+  group_by(BATTER_TXR_PLAYER_ID, BATTER_NAME, GAME_YEAR) %>%
+  summarise(IS_DP = sum(IS_DP),
+            Count = n()) %>%
+  mutate(NOT_DP = Count - IS_DP) %>%
+  relocate(NOT_DP, .before = Count) %>%
+  select(-IS_DP) %>%
+  mutate(Non_DP_Rate = NOT_DP / Count)
+```
+
+
+```{r}
+# Check first for a beta prior
+```
+
+
+```{r}
+non_dp_filtered <- non_dp %>%
+  filter(Count >= 5) %>%
+  filter(Non_DP_Rate > 0) %>%
+  filter(Non_DP_Rate < 1)
+
+m <- MASS::fitdistr(non_dp_filtered$Non_DP_Rate, dbeta,
+                    start = list(shape1 = 1, shape2 = 10))
+
+alpha0 <- m$estimate[1]
+beta0 <- m$estimate[2]
+
+hist(non_dp_filtered$Non_DP_Rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Distribution",
+     xlab="Values", ylab="Density",
+     ylim = c(0,4))
+
+curve(dbeta(x, alpha0, beta0), add=TRUE, col="red", lwd=2)
+
+list(alpha0, beta0)
+```
+
+
+```{r}
+# Check now for a beta binomial prior
+```
+
+
+```{r}
+# negative log likelihood of data given alpha; beta
+ll <- function(alpha, beta) {
+  -sum(dbetabinom.ab(non_dp$NOT_DP, non_dp$Count, alpha, beta, log = TRUE))
+}
+
+m <- mle(ll, start = list(alpha = 1, beta = 10), method = "L-BFGS-B")
+coef(m)
+```
+
+
+```{r}
+# Plot histogram of the data
+hist(non_dp$Non_DP_Rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Binomial Distribution",
+     xlab="Values", ylab="Density")
+
+# Parameters for the beta distribution (you might need to estimate these)
+alpha <- m@coef[["alpha"]]
+beta <- m@coef[["beta"]]
+
+# Add a beta distribution curve
+curve(dbeta(x, alpha, beta), add=TRUE, col="red", lwd=2)
+```
+
+
+```{r}
+non_dp_w_priors <- non_dp %>%
+  mutate(NOT_DP = ifelse(Count < 5, NOT_DP + alpha, NOT_DP),
+         Count = ifelse(Count < 5, Count + alpha + beta, Count),
+         Non_DP_Rate = NOT_DP / Count)
+```
+
+
+```{r}
+# Plot histogram of the data
+hist(non_dp_w_priors$Non_DP_Rate, breaks=10, freq=FALSE, col="lightblue", 
+     main="Histogram with Beta Binomial Distribution",
+     xlab="Values", ylab="Density")
+
+# Parameters for the beta distribution (you might need to estimate these)
+alpha <- m@coef[["alpha"]]
+beta <- m@coef[["beta"]]
+
+# Add a beta distribution curve
+curve(dbeta(x, alpha, beta), add=TRUE, col="red", lwd=2)
+```
+
+
+```{r}
+# Age and PA per year
+```
+
+
+```{r}
+floor_dec <- function(x, level=1) round(x - 5*10^(-level-1), level)
+
+age_pa_query <- "select TXR_PLAYER_ID, PLAYER_NAME_FL, last(ORGANIZATION_ABBREV) as ORG, GAME_YEAR, sum(PA) as PA
+from snowflake.rpt.view_mlb_curbat_player
+where GAME_YEAR in (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+and COMPETITION_LEVEL_ABBREV in ('MLB')
+and GAME_TYPE = 'R'
+GROUP BY PLAYER_NAME_FL, TXR_PLAYER_ID, GAME_YEAR
+ORDER BY PLAYER_NAME_FL, TXR_PLAYER_ID, GAME_YEAR, PA"
+
+age_pa_data <- SparkR::sql(age_pa_query) %>%
+    SparkR::as.data.frame() %>%
+    mutate(AGE_DATE = paste0(GAME_YEAR, "-04-01"))
+
+dob_query <- "select txr_player_id, 
+date_of_birth
+from platinum.rpt.player_lookup pl 
+where is_pitcher = FALSE
+and date_of_birth >= '1980-01-01'"
+
+dob_data <- SparkR::sql(dob_query) %>%
+    SparkR::as.data.frame()
+
+age_pa_data <- merge(age_pa_data, dob_data, by.x = 'TXR_PLAYER_ID', by.y = 'txr_player_id') %>%
+  mutate(AGE_401 = floor_dec(as.numeric(date_of_birth %--% AGE_DATE, "years"), 1)) %>%
+  select(-c(AGE_DATE, date_of_birth))
+```
+
+
+```{r}
+# True Sprint Speed
+```
+
+
+```{r}
+sprint_speed_query <- "select txr_player_id, player_name_fl, year, sum(runs_used) as runs_used, avg(sprint_speed) as sprint_speed
+from platinum.chipotle_gold.sprint_speed
+where year in (YEAR(CURDATE()) - 2, YEAR(CURDATE()) - 1)
+and home_competition_level_abbrev = 'MLB'
+and game_type = 'R'
+group by txr_player_id, player_name_fl, year
+order by txr_player_id, player_name_fl, year"
+
+sprint_speed <- SparkR::sql(sprint_speed_query) %>%
+  SparkR::as.data.frame() %>%
+  mutate(txr_player_id = as.numeric(txr_player_id))
+```
+
+
+```{r}
+# Merge all together
+```
+
+
+```{r}
+all_data <- merge(age_pa_data, sb_opp_w_priors, by.x = c("TXR_PLAYER_ID","PLAYER_NAME_FL","GAME_YEAR"), by.y = c("RUNNER_TXR_PLAYER_ID","RUNNER_1B", "YEAR"))
+all_data <- merge(all_data, triples_rate_w_priors, by = c("TXR_PLAYER_ID", "PLAYER_NAME_FL", "GAME_YEAR"))
+all_data <- merge(all_data, f_t_rate_w_priors, by.x = c("TXR_PLAYER_ID", "PLAYER_NAME_FL", "GAME_YEAR"), by.y = c("RUNNER_TXR_ID","RUNNER_NAME","GAME_YEAR"))
+all_data <- merge(all_data, non_dp_w_priors, by.x = c("TXR_PLAYER_ID", "PLAYER_NAME_FL", "GAME_YEAR"), by.y = c("BATTER_TXR_PLAYER_ID","BATTER_NAME","GAME_YEAR"))
+all_data <- merge(all_data, sprint_speed, by.x = c("TXR_PLAYER_ID", "PLAYER_NAME_FL", "GAME_YEAR"), by.y = c("txr_player_id", "player_name_fl", "year"))
+
+all_data <- all_data %>%
+  filter(runs_used >= 10) %>%
+  # filter(PA >= 150) %>%
+  # filter(f_t_opp >= 5) %>%
+  mutate(weight = ifelse(GAME_YEAR == as.numeric(format(Sys.Date(), "%Y")) - 2, 1 * PA, 2 * PA))
+
+all_data_avg <- all_data %>%
+  group_by(TXR_PLAYER_ID, PLAYER_NAME_FL) %>%
+  summarise(
+            AGE_401 = weighted.mean(AGE_401, weight),
+            SBOT = weighted.mean(SBOT, weight),
+            Triples_Rate = weighted.mean(Triples_Rate, weight),
+            f_t_rate = weighted.mean(f_t_rate, weight),
+            Non_DP_Rate = weighted.mean(Non_DP_Rate, weight),
+            sprint_speed = weighted.mean(sprint_speed, weight)
+            )
+```
+
+
+```{r}
+# Make the GAM model with separate smooth terms for each predictor
+```
+
+
+```{r}
+sprint_speed_model <- gam(sprint_speed ~ s(AGE_401) + s(SBOT) + s(Triples_Rate) + s(f_t_rate) + s(Non_DP_Rate), data = all_data_avg)
+```
+
+
+```{r}
+# Create experiment
+```
+
+
+```{r}
+with(mlflow::mlflow_start_run(experiment_id="EXPERIMENT_ID"), {
+predictor <- carrier::crate(function(x, ...) stats::predict(!!sprint_speed_model, newdata = x, ...))
+mlflow::mlflow_log_model(predictor, "MiLB_Sprint_Speed_Model")
+})
+```
+
+
+```{r}
+# Evaluate the Model
+```
+
+
+```{r}
+summary(sprint_speed_model)
+```
